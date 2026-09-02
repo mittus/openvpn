@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# End-to-end проверка ovpnctl внутри контейнера: установка, запуск демона,
+# подключение настоящего клиента по .ovpn, отзыв доступа.
+set -u
+export DEBIAN_FRONTEND=noninteractive
+PASS=0; FAIL=0
+ok(){ PASS=$((PASS+1)); echo "  [ok]   $1"; }
+bad(){ FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+chk(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+
+echo "=== система: $(. /etc/os-release; echo "$PRETTY_NAME") ==="
+# вспомогательные утилиты для самого теста (не зависимости ovpnctl)
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y -qq --no-install-recommends iputils-ping procps iproute2 >/dev/null 2>&1
+
+# systemd в контейнере нет: подсовываем заглушку, службы поднимем вручную
+mkdir -p /run/systemd/system
+cat >/usr/local/bin/systemctl <<'STUB'
+#!/bin/sh
+echo "[systemctl] $*" >> /var/log/systemctl-stub.log
+case "$1" in
+  is-active|is-enabled) exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x /usr/local/bin/systemctl
+hash -r
+
+echo; echo "=== 1. install.sh ==="
+cd /src || exit 1
+if bash install.sh > /var/log/install.log 2>&1 </dev/null; then
+    ok "install.sh отработал"
+else
+    bad "install.sh упал"; tail -30 /var/log/install.log
+fi
+# клиент и сервер в одном контейнере — переключаем точку входа на loopback
+ovpnctl set --endpoint 127.0.0.1 >/dev/null 2>&1 && ok "ovpnctl set --endpoint 127.0.0.1" \
+    || bad "ovpnctl set --endpoint"
+chk "после установки клиентов нет" "[ -z \"$(ls -A /etc/ovpnctl/profiles 2>/dev/null)\" ]"
+ovpnctl client add tester >/dev/null 2>&1 && ok "ovpnctl client add tester" || bad "ovpnctl client add tester"
+grep -E '^\[ovpnctl-install\]' /var/log/install.log | tail -12
+
+echo; echo "=== 2. артефакты ==="
+chk "бинарь ovpnctl"            "command -v ovpnctl"
+chk "config.json"               "test -f /etc/ovpnctl/config.json"
+chk "CA"                        "test -f /etc/ovpnctl/pki/ca.crt"
+chk "server.conf"               "test -f /etc/openvpn/server/server.conf"
+if command -v runuser >/dev/null 2>&1; then
+    chk "crl.pem читается пользователем nobody" "runuser -u nobody -- test -r /etc/openvpn/server/crl.pem"
+else
+    chk "crl.pem читается пользователем nobody" "su -s /bin/sh nobody -c 'test -r /etc/openvpn/server/crl.pem'"
+fi
+chk "профиль клиента создан"    "test -f /etc/ovpnctl/profiles/tester.ovpn"
+chk "юнит-файлы созданы"        "test -f /etc/systemd/system/ovpnctl-renew.timer -a -f /etc/systemd/system/ovpnctl-firewall.service"
+chk "drop-in создаёт /run/openvpn-server" "grep -q RuntimeDirectory=openvpn-server /etc/systemd/system/openvpn-server@server.service.d/ovpnctl.conf"
+chk "drop-in требует ovpnctl-firewall" "grep -q 'Requires=ovpnctl-firewall.service' /etc/systemd/system/openvpn-server@server.service.d/ovpnctl.conf"
+chk "каталог /run/openvpn-server создан" "test -d /run/openvpn-server"
+echo "  версия openvpn: $(openvpn --version | head -1 | awk '{print $2}'), openssl: $(openssl version | awk '{print $2}')"
+
+echo; echo "=== 3. правила файрвола ==="
+if /etc/ovpnctl/firewall.sh up >/dev/null 2>&1; then
+    chk "MASQUERADE добавлен" "iptables -t nat -S POSTROUTING | grep -q MASQUERADE"
+else
+    bad "firewall.sh up (нет NET_ADMIN?)"
+fi
+
+echo; echo "=== 4. запуск сервера с нашим server.conf ==="
+mkdir -p /run/openvpn-server
+openvpn --config /etc/openvpn/server/server.conf --daemon --log /var/log/ovpn-server.log
+sleep 4
+chk "процесс openvpn жив"       "pgrep -f 'openvpn --config /etc/openvpn/server' >/dev/null"
+chk "интерфейс tun0 поднят"     "ip addr show tun0"
+chk "нет ошибок в логе сервера" "! grep -qiE '^Options error|Fatal|cannot|error:' /var/log/ovpn-server.log"
+grep -E 'Initialization Sequence|OpenVPN 2|Diffie|Control Channel' /var/log/ovpn-server.log | tail -4
+
+echo; echo "=== 5. подключение настоящего клиента по .ovpn ==="
+ovpnctl client add phone >/dev/null 2>&1 && ok "ovpnctl client add phone" || bad "ovpnctl client add phone"
+cp /etc/ovpnctl/profiles/phone.ovpn /root/phone-backup.ovpn
+openvpn --config /etc/ovpnctl/profiles/phone.ovpn --route-nopull --daemon \
+        --log /var/log/ovpn-client.log
+sleep 8
+if grep -q "Initialization Sequence Completed" /var/log/ovpn-client.log; then
+    ok "клиент подключился (Initialization Sequence Completed)"
+else
+    bad "клиент не подключился"; tail -20 /var/log/ovpn-client.log
+fi
+chk "у клиента есть tun-интерфейс с адресом 10.8.0.x" "ip -4 addr | grep -q '10\.8\.0\.'"
+chk "пинг до сервера VPN 10.8.0.1" "ping -c 2 -W 3 10.8.0.1"
+echo "  --- выгрузка профилей в личный каталог пользователя ---"
+chk "client add сразу кладёт профиль в ~/ovpnctl" "test -s /root/ovpnctl/phone.ovpn"
+chk "содержимое совпадает с хранилищем" \
+    "[ \"$(md5sum < /root/ovpnctl/phone.ovpn)\" = \"$(md5sum < /etc/ovpnctl/profiles/phone.ovpn)\" ]"
+chk "права профиля 0600" "[ \"$(stat -c %a /root/ovpnctl/phone.ovpn)\" = 600 ]"
+chk "каталог ~/ovpnctl закрыт (0700)" "[ \"$(stat -c %a /root/ovpnctl)\" = 700 ]"
+
+rm -f /root/ovpnctl/phone.ovpn
+( cd /tmp && ovpnctl client export phone >/dev/null 2>&1 )
+chk "export без пути игнорирует текущий каталог и пишет в ~/ovpnctl" \
+    "test -s /root/ovpnctl/phone.ovpn -a ! -e /tmp/phone.ovpn"
+ovpnctl client export phone /tmp/custom >/dev/null 2>&1
+chk "export с явным путём кладёт файл туда" "test -s /tmp/custom"
+mkdir -p /tmp/box && ovpnctl client export phone /tmp/box >/dev/null 2>&1
+chk "export в каталог кладёт /tmp/box/phone.ovpn" "test -s /tmp/box/phone.ovpn"
+
+# эмулируем запуск через sudo: файл должен уйти в дом пользователя и принадлежать ему
+useradd -m vpnuser >/dev/null 2>&1
+SUDO_USER=vpnuser ovpnctl client export phone >/dev/null 2>&1
+chk "под sudo профиль уходит в /home/vpnuser/ovpnctl" "test -s /home/vpnuser/ovpnctl/phone.ovpn"
+chk "владелец файла — вызвавший пользователь" \
+    "[ \"$(stat -c %U /home/vpnuser/ovpnctl/phone.ovpn)\" = vpnuser ]"
+chk "владелец каталога — вызвавший пользователь" \
+    "[ \"$(stat -c %U /home/vpnuser/ovpnctl)\" = vpnuser ]"
+
+echo "  --- ovpnctl online ---"; ovpnctl online
+echo "  --- ovpnctl status (фрагмент) ---"; ovpnctl status 2>&1 | head -14
+
+echo; echo "=== 6. отзыв доступа ==="
+ovpnctl client revoke phone -y >/dev/null 2>&1 && ok "client revoke отработал" || bad "client revoke"
+chk "серийник в CRL" "openssl crl -in /etc/openvpn/server/crl.pem -noout -text | grep -q 'Serial Number'"
+pkill -f 'openvpn --config /etc/ovpnctl/profiles/phone.ovpn'; sleep 2
+SRV_LOG_MARK=$(wc -l < /var/log/ovpn-server.log)
+: > /var/log/ovpn-client2.log
+openvpn --config /root/phone-backup.ovpn --route-nopull --daemon --log /var/log/ovpn-client2.log 2>/dev/null
+sleep 12
+tail -n +$SRV_LOG_MARK /var/log/ovpn-server.log > /tmp/srv-after-revoke.log
+if grep -qiE 'CRL|revoked' /tmp/srv-after-revoke.log; then
+    ok "сервер отверг отозванный сертификат по CRL"
+    grep -iE 'CRL|revoked' /tmp/srv-after-revoke.log | head -3 | sed 's/^/    /'
+else
+    bad "в логе сервера нет отказа по CRL"; tail -15 /tmp/srv-after-revoke.log
+fi
+if grep -q "Initialization Sequence Completed" /var/log/ovpn-client2.log; then
+    bad "отозванный клиент всё-таки подключился"
+else
+    ok "отозванный клиент туннель не поднял"
+fi
+pkill -f 'openvpn --config /root/phone-backup.ovpn' 2>/dev/null
+
+echo; echo "=== 7. автопродление и диагностика ==="
+cp /etc/ovpnctl/profiles/tester.ovpn /root/tester-before-rotation.ovpn
+ovpnctl pki check 2>&1 | head -8
+ovpnctl pki renew --force >/dev/null 2>&1 && ok "pki renew --force отработал" || bad "pki renew --force"
+chk "лог продления записан" "test -s /var/log/ovpnctl/renew.log"
+tail -4 /var/log/ovpnctl/renew.log
+ovpnctl doctor 2>&1 | tail -12
+
+echo; echo "=== 8. ротация CA не рвёт уже выданные профили ==="
+# systemd-заглушка службу не перезапускает — делаем это руками
+pkill -f "openvpn --config /etc/openvpn/server" ; sleep 2
+: > /var/log/ovpn-server2.log
+openvpn --config /etc/openvpn/server/server.conf --daemon --log /var/log/ovpn-server2.log
+sleep 4
+if pgrep -f 'openvpn --config /etc/openvpn/server' >/dev/null; then
+    ok "сервер поднялся с перевыпущенным сертификатом"
+else
+    bad "сервер не поднялся после ротации PKI"
+    echo "    --- лог сервера ---"; tail -25 /var/log/ovpn-server2.log | sed 's/^/    /'
+    echo "    --- файлы ---"; ls -l /etc/openvpn/server/ | sed 's/^/    /'
+    echo "    --- проверка пары ключ/сертификат ---"
+    openssl x509 -in /etc/openvpn/server/server.crt -noout -pubkey | md5sum | sed 's/^/    cert: /'
+    openssl pkey -in /etc/openvpn/server/server.key -pubout | md5sum | sed 's/^/    key:  /'
+    openssl verify -CAfile /etc/openvpn/server/ca.crt /etc/openvpn/server/server.crt | sed 's/^/    /'
+fi
+: > /var/log/ovpn-old-profile.log
+openvpn --config /root/tester-before-rotation.ovpn --route-nopull --daemon --log /var/log/ovpn-old-profile.log
+sleep 10
+if grep -q "Initialization Sequence Completed" /var/log/ovpn-old-profile.log; then
+    ok "СТАРЫЙ профиль (выданный до ротации CA) продолжает подключаться"
+else
+    bad "старый профиль перестал работать после ротации CA"
+    tail -15 /var/log/ovpn-old-profile.log
+fi
+grep -E "VERIFY OK: depth=1|Initialization Sequence" /var/log/ovpn-old-profile.log | head -3 | sed "s/^/    /"
+pkill -f "openvpn --config /root/tester-before-rotation.ovpn"; sleep 1
+: > /var/log/ovpn-new-profile.log
+openvpn --config /etc/ovpnctl/profiles/tester.ovpn --route-nopull --daemon --log /var/log/ovpn-new-profile.log
+sleep 10
+if grep -q "Initialization Sequence Completed" /var/log/ovpn-new-profile.log; then
+    ok "обновлённый профиль тоже подключается"
+else
+    bad "обновлённый профиль не подключается"; tail -15 /var/log/ovpn-new-profile.log
+fi
+pkill -f "openvpn --config /etc/ovpnctl/profiles/tester.ovpn"
+
+echo; echo "=== 9. selftest в контейнере ==="
+python3 /src/tests/selftest.py 2>&1 | tail -3
+
+echo; echo "============================================================"
+echo "ИТОГ: пройдено $PASS, провалено $FAIL"
+exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)

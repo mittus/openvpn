@@ -1,0 +1,457 @@
+"""Собственный PKI-слой поверх openssl (без easy-rsa — одинаково работает
+на Debian 11/12/13 и Ubuntu 20.04+, где версии easy-rsa несовместимы между собой).
+
+Каталог PKI:
+    /etc/ovpnctl/pki/
+        openssl.cnf        сгенерированный конфиг CA
+        ca.crt             текущий сертификат CA
+        private/ca.key     ключ CA (никогда не меняется при продлении!)
+        private/<n>.key    ключи сервера/клиентов
+        issued/<n>.crt     выданные сертификаты
+        reqs/<n>.req       запросы
+        archive/           сертификаты, заменённые при продлении
+        newcerts/          копии по серийникам (нужно openssl ca)
+        index.txt, serial, crlnumber, crl.pem
+        tc.key             ключ tls-crypt
+        db.json            метаданные клиентов
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import re
+import shutil
+
+from . import config as cfgmod
+from .util import OvpnError, ensure_dir, read_file, run, write_file
+
+PKI = cfgmod.PKI_DIR
+
+
+def p(*parts) -> str:
+    return os.path.join(PKI, *parts)
+
+
+CA_CRT = p("ca.crt")
+CA_KEY = p("private", "ca.key")
+CRL = p("crl.pem")
+TC_KEY = p("tc.key")
+DB_JSON = p("db.json")
+OPENSSL_CNF = p("openssl.cnf")
+
+SERVER_NAME = "server"
+
+OPENSSL_CNF_TEMPLATE = """# Сгенерировано ovpnctl. Правки будут перезаписаны.
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+dir               = {pki}
+database          = $dir/index.txt
+serial            = $dir/serial
+crlnumber         = $dir/crlnumber
+new_certs_dir     = $dir/newcerts
+certificate       = $dir/ca.crt
+private_key       = $dir/private/ca.key
+default_md        = {digest}
+default_days      = {client_days}
+default_crl_days  = {crl_days}
+policy            = policy_anything
+email_in_dn       = no
+unique_subject    = no
+rand_serial       = yes
+preserve          = no
+name_opt          = ca_default
+cert_opt          = ca_default
+copy_extensions   = none
+
+[ policy_anything ]
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[ req ]
+default_bits        = {rsa_bits}
+default_md          = {digest}
+distinguished_name  = req_dn
+string_mask         = utf8only
+prompt              = no
+utf8                = yes
+
+[ req_dn ]
+commonName = ovpnctl
+
+[ v3_ca ]
+subjectKeyIdentifier   = hash
+basicConstraints       = critical,CA:true
+keyUsage               = critical,cRLSign,keyCertSign
+
+[ server_cert ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+extendedKeyUsage       = serverAuth
+keyUsage               = critical,digitalSignature,keyEncipherment
+
+[ client_cert ]
+basicConstraints       = CA:FALSE
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+extendedKeyUsage       = clientAuth
+keyUsage               = critical,digitalSignature
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Инфраструктура каталога
+# --------------------------------------------------------------------------- #
+def ensure_layout(cfg: dict) -> None:
+    ensure_dir(PKI, 0o700)
+    for sub in ("private", "issued", "reqs", "newcerts", "archive", "revoked"):
+        ensure_dir(p(sub), 0o700)
+    if not os.path.exists(p("index.txt")):
+        write_file(p("index.txt"), "", 0o600)
+    if not os.path.exists(p("index.txt.attr")):
+        write_file(p("index.txt.attr"), "unique_subject = no\n", 0o600)
+    if not os.path.exists(p("serial")):
+        write_file(p("serial"), "%032X\n" % random_serial(), 0o600)
+    if not os.path.exists(p("crlnumber")):
+        write_file(p("crlnumber"), "1000\n", 0o600)
+    write_openssl_cnf(cfg)
+
+
+def write_openssl_cnf(cfg: dict) -> None:
+    write_file(
+        OPENSSL_CNF,
+        OPENSSL_CNF_TEMPLATE.format(
+            pki=PKI,
+            digest=cfg.get("digest", "sha256"),
+            client_days=cfg.get("client_days", 3650),
+            crl_days=cfg.get("crl_days", 3650),
+            rsa_bits=cfg.get("rsa_bits", 3072),
+        ),
+        0o600,
+    )
+
+
+def random_serial() -> int:
+    """Случайный положительный 128-битный серийник."""
+    return (int.from_bytes(os.urandom(16), "big") >> 1) | 1
+
+
+# --------------------------------------------------------------------------- #
+# База клиентов
+# --------------------------------------------------------------------------- #
+def db_load() -> dict:
+    if not os.path.exists(DB_JSON):
+        return {"clients": {}, "server": {}}
+    try:
+        with open(DB_JSON) as fh:
+            data = json.load(fh)
+    except ValueError:
+        raise OvpnError("повреждён %s" % DB_JSON)
+    data.setdefault("clients", {})
+    data.setdefault("server", {})
+    return data
+
+
+def db_save(data: dict) -> None:
+    write_file(DB_JSON, json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n", 0o600)
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --------------------------------------------------------------------------- #
+# Ключи и сертификаты
+# --------------------------------------------------------------------------- #
+def gen_key(path: str, cfg: dict) -> str:
+    ensure_dir(os.path.dirname(path), 0o700)
+    if cfg.get("key_type", "ec") == "ec":
+        cmd = [
+            "openssl", "genpkey", "-algorithm", "EC",
+            "-pkeyopt", "ec_paramgen_curve:%s" % cfg.get("ec_curve", "prime256v1"),
+            "-pkeyopt", "ec_param_enc:named_curve",
+            "-out", path,
+        ]
+    else:
+        cmd = [
+            "openssl", "genpkey", "-algorithm", "RSA",
+            "-pkeyopt", "rsa_keygen_bits:%d" % int(cfg.get("rsa_bits", 3072)),
+            "-out", path,
+        ]
+    run(cmd)
+    os.chmod(path, 0o600)
+    return path
+
+
+def gen_csr(name: str, key_path: str, cfg: dict) -> str:
+    csr = p("reqs", "%s.req" % name)
+    run([
+        "openssl", "req", "-new", "-key", key_path, "-out", csr,
+        "-config", OPENSSL_CNF, "-subj", "/CN=%s" % name,
+        "-%s" % cfg.get("digest", "sha256"),
+    ])
+    os.chmod(csr, 0o600)
+    return csr
+
+
+def sign_csr(name: str, csr: str, profile: str, days: int, cfg: dict) -> str:
+    """profile: server_cert | client_cert"""
+    crt = p("issued", "%s.crt" % name)
+    run([
+        "openssl", "ca", "-batch", "-config", OPENSSL_CNF,
+        "-extensions", profile, "-days", str(int(days)),
+        "-md", cfg.get("digest", "sha256"), "-notext",
+        "-in", csr, "-out", crt,
+    ])
+    os.chmod(crt, 0o644)
+    return crt
+
+
+def create_ca(cfg: dict) -> None:
+    if os.path.exists(CA_CRT):
+        raise OvpnError("CA уже существует: %s" % CA_CRT)
+    ensure_layout(cfg)
+    gen_key(CA_KEY, cfg)
+    subject = "/CN=%s CA" % cfg.get("cn_prefix", "ovpnctl")
+    run([
+        "openssl", "req", "-x509", "-new", "-key", CA_KEY, "-out", CA_CRT,
+        "-days", str(int(cfg["ca_days"])), "-config", OPENSSL_CNF,
+        "-extensions", "v3_ca", "-subj", subject,
+        "-%s" % cfg.get("digest", "sha256"),
+        "-set_serial", "0x%X" % random_serial(),
+    ])
+    os.chmod(CA_CRT, 0o644)
+
+
+def archived_cas():
+    """Предыдущие сертификаты CA (тот же ключ, другой срок) — для диагностики."""
+    directory = p("archive")
+    if not os.path.isdir(directory):
+        return []
+    return [os.path.join(directory, f) for f in sorted(os.listdir(directory))
+            if f.startswith("ca-") and f.endswith(".crt")]
+
+
+def issue(name: str, profile: str, days: int, cfg: dict, reuse_key: bool = False) -> dict:
+    """Выпуск сертификата (сервер или клиент).
+
+    Срок автоматически подрезается сроком CA: openssl не подписывает сертификат,
+    который переживёт собственный CA.
+    """
+    ensure_layout(cfg)
+    ca_left = days_left(CA_CRT)
+    if ca_left <= 0:
+        raise OvpnError("CA истёк — сначала выполните 'ovpnctl pki renew --force'.")
+    days = max(1, min(int(days), ca_left - 1))
+    key_path = p("private", "%s.key" % name)
+    if not (reuse_key and os.path.exists(key_path)):
+        gen_key(key_path, cfg)
+    csr = gen_csr(name, key_path, cfg)
+    crt = sign_csr(name, csr, profile, days, cfg)
+    return {"name": name, "key": key_path, "crt": crt, "csr": csr}
+
+
+def revoke(name: str, cfg: dict) -> None:
+    crt = p("issued", "%s.crt" % name)
+    if not os.path.exists(crt):
+        raise OvpnError("сертификат '%s' не найден." % name)
+    run(["openssl", "ca", "-batch", "-config", OPENSSL_CNF, "-revoke", crt])
+    shutil.move(crt, p("revoked", "%s-%s.crt" % (name, datetime.date.today().isoformat())))
+    gen_crl(cfg)
+
+
+def gen_crl(cfg: dict) -> str:
+    ensure_layout(cfg)
+    tmp = CRL + ".new"
+    run([
+        "openssl", "ca", "-gencrl", "-batch", "-config", OPENSSL_CNF,
+        "-crldays", str(int(cfg.get("crl_days", 3650))), "-out", tmp,
+    ])
+    os.replace(tmp, CRL)
+    os.chmod(CRL, 0o644)   # читается openvpn уже после сброса привилегий на nobody
+    return CRL
+
+
+def renew_ca(cfg: dict) -> dict:
+    """Перевыпуск CA тем же ключом и с тем же subject.
+
+    Ключ и subject не меняются => AKI/SKI и цепочка сохраняются, все ранее
+    выданные клиентские сертификаты остаются валидными.
+    """
+    if not os.path.exists(CA_KEY):
+        raise OvpnError("нет ключа CA: %s" % CA_KEY)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    archived = p("archive", "ca-%s.crt" % stamp)
+    shutil.copy2(CA_CRT, archived)
+
+    csr = p("reqs", "ca-renew.req")
+    run(["openssl", "x509", "-x509toreq", "-in", CA_CRT, "-signkey", CA_KEY, "-out", csr])
+
+    ext = p("ca-renew.ext")
+    write_file(
+        ext,
+        "subjectKeyIdentifier = hash\n"
+        "basicConstraints = critical,CA:true\n"
+        "keyUsage = critical,cRLSign,keyCertSign\n",
+        0o600,
+    )
+    new_crt = CA_CRT + ".new"
+    run([
+        "openssl", "x509", "-req", "-in", csr, "-signkey", CA_KEY,
+        "-days", str(int(cfg["ca_days"])), "-%s" % cfg.get("digest", "sha256"),
+        "-extfile", ext, "-set_serial", "0x%X" % random_serial(), "-out", new_crt,
+    ])
+    # проверяем, что новый CA действительно валиден и совпадает по subject
+    old_subject = subject_of(CA_CRT)
+    new_subject = subject_of(new_crt)
+    if old_subject != new_subject:
+        os.unlink(new_crt)
+        raise OvpnError("продление CA дало другой subject (%s != %s)" % (old_subject, new_subject))
+    os.replace(new_crt, CA_CRT)
+    os.chmod(CA_CRT, 0o644)
+    os.unlink(ext)
+
+    # Страховка: все действующие сертификаты обязаны проверяться новым CA.
+    broken = [name for name in active_cert_names() if not verify_chain(name)]
+    if broken:
+        shutil.copy2(archived, CA_CRT)      # откат
+        raise OvpnError(
+            "продление CA откачено: сертификаты %s перестали проходить проверку цепочки."
+            % ", ".join(broken))
+    return {"archived": archived, "not_after": not_after(CA_CRT).isoformat()}
+
+
+def old_ca_still_trusts(cert_name: str) -> bool:
+    """Проверяет, что уже розданные профили (в них лежит прежняя копия CA)
+    продолжают доверять указанному сертификату."""
+    previous = archived_cas()
+    if not previous:
+        return True
+    latest = previous[-1]
+    if days_left(latest) <= 0:
+        return True
+    proc = run(["openssl", "verify", "-CAfile", latest, cert_path(cert_name)], check=False)
+    return proc.returncode == 0
+
+
+def active_cert_names():
+    """Имена всех выпущенных и не отозванных сертификатов."""
+    issued = p("issued")
+    if not os.path.isdir(issued):
+        return []
+    return sorted(f[:-4] for f in os.listdir(issued) if f.endswith(".crt"))
+
+
+def ensure_tc_key() -> str:
+    """Ключ tls-crypt (защита control-канала). Не истекает."""
+    if not os.path.exists(TC_KEY):
+        from .system import openvpn_genkey
+
+        openvpn_genkey(TC_KEY)
+    return TC_KEY
+
+
+# --------------------------------------------------------------------------- #
+# Разбор сертификатов
+# --------------------------------------------------------------------------- #
+def _x509_field(path: str, *args) -> str:
+    if not os.path.exists(path):
+        raise OvpnError("файл сертификата не найден: %s" % path)
+    proc = run(["openssl", "x509", "-in", path, "-noout"] + list(args))
+    return (proc.stdout or "").strip()
+
+
+def subject_of(path: str) -> str:
+    """Subject в нормализованном виде: разные версии openssl печатают
+    'subject=CN = x' и 'subject=CN=x'."""
+    out = _x509_field(path, "-subject")
+    value = out.split("=", 1)[1].strip() if "=" in out else out
+    return re.sub(r"\s*=\s*", "=", re.sub(r"\s+", " ", value)).strip()
+
+
+def serial_of(path: str) -> str:
+    out = _x509_field(path, "-serial")
+    return out.split("=", 1)[1].strip() if "=" in out else out
+
+
+def fingerprint(path: str) -> str:
+    out = _x509_field(path, "-fingerprint", "-sha256")
+    return out.split("=", 1)[1].strip() if "=" in out else out
+
+
+def not_after(path: str) -> datetime.datetime:
+    out = _x509_field(path, "-enddate")          # notAfter=Sep  2 10:00:00 2035 GMT
+    value = out.split("=", 1)[1].strip()
+    return _parse_openssl_time(value)
+
+
+def not_before(path: str) -> datetime.datetime:
+    out = _x509_field(path, "-startdate")
+    value = out.split("=", 1)[1].strip()
+    return _parse_openssl_time(value)
+
+
+def _parse_openssl_time(value: str) -> datetime.datetime:
+    """Разбор дат openssl: 'Sep  2 10:00:00 2035 GMT' (двойные пробелы возможны)."""
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    cleaned = re.sub(r"\s+(GMT|UTC)$", "", cleaned)
+    try:
+        parsed = datetime.datetime.strptime(cleaned, "%b %d %H:%M:%S %Y")
+    except ValueError:
+        raise OvpnError("не разобрана дата сертификата: %r" % value)
+    return parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def days_left(path: str) -> int:
+    delta = not_after(path) - datetime.datetime.now(datetime.timezone.utc)
+    return int(delta.total_seconds() // 86400)
+
+
+def crl_next_update() -> datetime.datetime:
+    if not os.path.exists(CRL):
+        raise OvpnError("CRL отсутствует: %s" % CRL)
+    proc = run(["openssl", "crl", "-in", CRL, "-noout", "-nextupdate"])
+    value = (proc.stdout or "").split("=", 1)[1].strip()
+    return _parse_openssl_time(value)
+
+
+def crl_days_left() -> int:
+    delta = crl_next_update() - datetime.datetime.now(datetime.timezone.utc)
+    return int(delta.total_seconds() // 86400)
+
+
+def cert_path(name: str) -> str:
+    return p("issued", "%s.crt" % name)
+
+
+def key_path(name: str) -> str:
+    return p("private", "%s.key" % name)
+
+
+def exists(name: str) -> bool:
+    return os.path.exists(cert_path(name))
+
+
+def verify_chain(name: str) -> bool:
+    """Проверка, что сертификат подписан текущим CA-бандлом."""
+    proc = run(["openssl", "verify", "-CAfile", CA_CRT, cert_path(name)], check=False)
+    return proc.returncode == 0
+
+
+def valid_name(name: str) -> str:
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name or ""):
+        raise OvpnError(
+            "недопустимое имя '%s': разрешены латиница, цифры, точка, дефис, подчёркивание (до 64 символов)."
+            % name
+        )
+    if name == SERVER_NAME:
+        raise OvpnError("имя 'server' зарезервировано для серверного сертификата.")
+    return name

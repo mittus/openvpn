@@ -1,0 +1,476 @@
+"""Генерация серверной конфигурации OpenVPN, файрвола и systemd-обвязки."""
+from __future__ import annotations
+
+import ipaddress
+import os
+import re
+import shutil
+import socket
+
+from . import config as cfgmod
+from . import pki
+from .system import (
+    daemon_reload,
+    default_nic,
+    enable_ip_forward,
+    openvpn_group,
+    openvpn_version,
+    run,
+    service_active,
+    systemctl,
+)
+from .util import OvpnError, ensure_dir, info, read_file, which, write_file
+
+DROPIN_DIR = cfgmod.ROOT + "/etc/systemd/system/openvpn-server@server.service.d"
+FIREWALL_SCRIPT = os.path.join(cfgmod.ETC_DIR, "firewall.sh")
+CCD_DIR = os.path.join(cfgmod.SERVER_DIR, "ccd")
+# ipp.txt держим рядом с конфигом: каталог разрешён профилем AppArmor openvpn
+IPP_FILE = os.path.join(cfgmod.SERVER_DIR, "ipp.txt")
+
+
+# --------------------------------------------------------------------------- #
+# server.conf
+# --------------------------------------------------------------------------- #
+def build_server_conf(cfg: dict) -> str:
+    ver = openvpn_version()
+    group = openvpn_group()
+    lines = [
+        "# Сгенерировано ovpnctl — правки перезаписываются при 'ovpnctl server rebuild'.",
+        "port %d" % cfg["port"],
+        "proto %s" % ("udp6" if cfg.get("ipv6") and cfg["proto"] == "udp" else cfg["proto"]),
+        "dev %s" % cfg.get("dev", "tun"),
+        "topology subnet",
+        "server %s %s" % (cfg["subnet"], cfg["netmask"]),
+        "",
+        "ca %s/ca.crt" % cfgmod.SERVER_DIR,
+        "cert %s/server.crt" % cfgmod.SERVER_DIR,
+        "key %s/server.key" % cfgmod.SERVER_DIR,
+        "dh none",
+        "tls-crypt %s/tc.key" % cfgmod.SERVER_DIR,
+        "crl-verify %s/crl.pem" % cfgmod.SERVER_DIR,
+        "",
+        "tls-server",
+        "tls-version-min 1.2",
+        "remote-cert-eku \"TLS Web Client Authentication\"",
+        "auth SHA256",
+    ]
+
+    if ver >= (2, 5):
+        lines += [
+            "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
+            "data-ciphers-fallback AES-256-GCM",
+            "allow-compression no",
+        ]
+    else:
+        lines += [
+            "cipher AES-256-GCM",
+            "ncp-ciphers AES-256-GCM:AES-128-GCM",
+        ]
+
+    lines += [
+        "",
+        "ifconfig-pool-persist %s 0" % IPP_FILE,
+        "client-config-dir %s" % CCD_DIR,
+        "keepalive 10 120",
+        "persist-key",
+        "persist-tun",
+        "user nobody",
+        "group %s" % group,
+        "",
+        "status %s 10" % cfgmod.STATUS_FILE,
+        "status-version 2",
+        "management %s unix" % cfgmod.MGMT_SOCKET,
+        "verb 3",
+        "mute 20",
+    ]
+
+    if cfg["proto"] == "udp":
+        lines.append("explicit-exit-notify 1")
+
+    pushes = []
+    if cfg.get("redirect_gateway", True):
+        pushes.append('push "redirect-gateway def1 bypass-dhcp"')
+        pushes.append('push "block-outside-dns"')
+    for dns in cfg.get("dns") or []:
+        pushes.append('push "dhcp-option DNS %s"' % dns)
+
+    if cfg.get("ipv6"):
+        lines += ["", "server-ipv6 %s" % cfg.get("subnet6", "fd42:42:42:42::/112")]
+        pushes.append('push "route-ipv6 2000::/3"')
+        if cfg.get("redirect_gateway", True):
+            pushes.append('push "redirect-gateway ipv6"')
+
+    if pushes:
+        lines += [""] + pushes
+
+    extra = os.path.join(cfgmod.ETC_DIR, "server.extra.conf")
+    if os.path.exists(extra):
+        lines += ["", "# --- пользовательские директивы из %s ---" % extra, read_file(extra).rstrip()]
+
+    return "\n".join(lines) + "\n"
+
+
+def deploy_pki_to_server(cfg: dict) -> None:
+    """Копируем материалы PKI туда, где их читает openvpn (уже без root-привилегий)."""
+    ensure_dir(cfgmod.SERVER_DIR, 0o755)   # nobody должен доходить до crl.pem
+    ensure_dir(CCD_DIR, 0o755)
+    ensure_dir(os.path.dirname(cfgmod.STATUS_FILE), 0o710)
+
+    pairs = [
+        (pki.CA_CRT, os.path.join(cfgmod.SERVER_DIR, "ca.crt"), 0o644),
+        (pki.cert_path(pki.SERVER_NAME), os.path.join(cfgmod.SERVER_DIR, "server.crt"), 0o644),
+        (pki.key_path(pki.SERVER_NAME), os.path.join(cfgmod.SERVER_DIR, "server.key"), 0o600),
+        (pki.TC_KEY, os.path.join(cfgmod.SERVER_DIR, "tc.key"), 0o600),
+        (pki.CRL, os.path.join(cfgmod.SERVER_DIR, "crl.pem"), 0o644),
+    ]
+    for src, dst, mode in pairs:
+        if not os.path.exists(src):
+            raise OvpnError("отсутствует файл PKI: %s" % src)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, mode)
+
+    if not os.path.exists(IPP_FILE):
+        write_file(IPP_FILE, "", 0o644)
+    try:
+        shutil.chown(IPP_FILE, "nobody", openvpn_group())
+    except (LookupError, PermissionError):
+        pass
+
+
+def write_server_conf(cfg: dict) -> str:
+    path = cfgmod.server_conf_path()
+    write_file(path, build_server_conf(cfg), 0o600)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Файрвол (без зависимости от netfilter-persistent / ufw)
+# --------------------------------------------------------------------------- #
+FIREWALL_TEMPLATE = """#!/usr/bin/env bash
+# Сгенерировано ovpnctl. Правила NAT/forward для VPN-подсети.
+set -u
+ACTION="${{1:-up}}"
+NIC="{nic}"
+NET4="{net4}"
+NET6="{net6}"
+PORT="{port}"
+PROTO="{proto}"
+DEV="{dev}"
+IPV6="{ipv6}"
+
+ipt4() {{ iptables "$@" 2>/dev/null; }}
+ipt6() {{ command -v ip6tables >/dev/null 2>&1 && ip6tables "$@" 2>/dev/null; }}
+
+rules4=(
+  "-t nat -A POSTROUTING -s $NET4 -o $NIC -j MASQUERADE"
+  "-A INPUT -i $NIC -p $PROTO --dport $PORT -j ACCEPT"
+  "-A INPUT -i $DEV+ -j ACCEPT"
+  "-A FORWARD -i $DEV+ -o $NIC -j ACCEPT"
+  "-A FORWARD -i $NIC -o $DEV+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+)
+rules6=(
+  "-t nat -A POSTROUTING -s $NET6 -o $NIC -j MASQUERADE"
+  "-A INPUT -i $DEV+ -j ACCEPT"
+  "-A FORWARD -i $DEV+ -o $NIC -j ACCEPT"
+  "-A FORWARD -i $NIC -o $DEV+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+)
+
+apply() {{
+  local mode="$1"
+  for r in "${{rules4[@]}}"; do
+    # shellcheck disable=SC2086
+    if [ "$mode" = up ]; then
+      ipt4 ${{r/-A/-C}} || ipt4 $r
+    else
+      ipt4 ${{r/-A/-D}} || true
+    fi
+  done
+  if [ "$IPV6" = "1" ]; then
+    for r in "${{rules6[@]}}"; do
+      # shellcheck disable=SC2086
+      if [ "$mode" = up ]; then
+        ipt6 ${{r/-A/-C}} || ipt6 $r
+      else
+        ipt6 ${{r/-A/-D}} || true
+      fi
+    done
+  fi
+}}
+
+case "$ACTION" in
+  up)   apply up ;;
+  down) apply down ;;
+  *)    echo "usage: $0 up|down" >&2; exit 1 ;;
+esac
+exit 0
+"""
+
+
+def write_firewall_script(cfg: dict) -> str:
+    net4 = cfgmod.network_cidr(cfg)
+    content = FIREWALL_TEMPLATE.format(
+        nic=cfg["nic"],
+        net4=net4,
+        net6=cfg.get("subnet6", "fd42:42:42:42::/112"),
+        port=cfg["port"],
+        proto=cfg["proto"],
+        dev=cfg.get("dev", "tun"),
+        ipv6="1" if cfg.get("ipv6") else "0",
+    )
+    write_file(FIREWALL_SCRIPT, content, 0o750)
+    return FIREWALL_SCRIPT
+
+
+def ufw_available() -> bool:
+    return which("ufw") is not None
+
+
+def ufw_active() -> bool:
+    if not ufw_available():
+        return False
+    return "Status: active" in (run(["ufw", "status"], check=False).stdout or "")
+
+
+def ssh_ports() -> list:
+    """Порты sshd — чтобы 'ufw enable' не отрезал администратора."""
+    ports = []
+    config = cfgmod.ROOT + "/etc/ssh/sshd_config"
+    if os.path.exists(config):
+        for line in read_file(config).splitlines():
+            match = re.match(r"^\s*Port\s+(\d+)", line)
+            if match:
+                ports.append(int(match.group(1)))
+    return ports or [22]
+
+
+def setup_ufw(cfg: dict, install: bool = False, remove: bool = False, with_ssh: bool = False,
+              old_port: int = None, old_proto: str = None) -> list:
+    """Открывает (или убирает) в ufw порт OpenVPN.
+
+    Больше ничего не требуется: NAT и пересылку ставит ovpnctl-firewall.service,
+    а ufw сторонние правила не вычищает — свои он грузит через iptables-restore
+    с -n (без flush), и терминального запрета для FORWARD у него нет. В INPUT,
+    наоборот, ufw обрывает пакеты раньше наших правил, поэтому порт VPN нужно
+    разрешить именно средствами ufw.
+    """
+    steps = []
+    if not ufw_available():
+        if remove:
+            return ["ufw не установлен — убирать нечего"]
+        if not install:
+            raise OvpnError(
+                "ufw не установлен. Поставьте его (apt install ufw) или выполните "
+                "'ovpnctl ufw --install'.")
+        from .system import apt_install
+
+        apt_install(["ufw"])
+        steps.append("установлен пакет ufw")
+
+    port_rule = "%d/%s" % (cfg["port"], cfg["proto"])
+
+    if remove:
+        run(["ufw", "delete", "allow", port_rule], check=False)
+        steps.append("удалено разрешение %s" % port_rule)
+        cfg["ufw_configured"] = False
+    else:
+        if old_port and (old_port != cfg["port"] or old_proto != cfg["proto"]):
+            run(["ufw", "delete", "allow", "%d/%s" % (old_port, old_proto or cfg["proto"])],
+                check=False)
+            steps.append("удалено старое разрешение %d/%s" % (old_port, old_proto or cfg["proto"]))
+
+        run(["ufw", "allow", port_rule, "comment", "ovpnctl OpenVPN"], check=False)
+        steps.append("разрешён входящий трафик %s (порт VPN)" % port_rule)
+
+        if with_ssh:
+            for port in ssh_ports():
+                run(["ufw", "allow", "%d/tcp" % port, "comment", "SSH"], check=False)
+                steps.append("разрешён SSH %d/tcp" % port)
+
+        cfg["ufw_configured"] = True
+
+    if ufw_active():
+        run(["ufw", "--force", "reload"], check=False)
+        steps.append("ufw перезагружен")
+    elif not remove:
+        steps.append("ufw сейчас неактивен: правило сохранено и заработает после 'ufw enable' "
+                     "(проверьте, что открыт SSH — 'ovpnctl ufw --ssh' добавит и его)")
+    cfgmod.save(cfg)
+    return steps
+
+
+def configure_ufw(cfg: dict) -> None:
+    """Автоматический вызов при установке: у активного ufw открываем порт VPN."""
+    if not ufw_active():
+        return
+    info("Обнаружен активный ufw — открываю порт OpenVPN.")
+    for step in setup_ufw(cfg):
+        info("  • %s" % step)
+
+
+# --------------------------------------------------------------------------- #
+# systemd
+# --------------------------------------------------------------------------- #
+DROPIN = """[Unit]
+# Сгенерировано ovpnctl
+Requires=ovpnctl-firewall.service
+After=ovpnctl-firewall.service network-online.target
+Wants=network-online.target
+
+[Service]
+# В Debian/Ubuntu /run/openvpn-server создаётся через tmpfiles.d, а не юнитом.
+# Просим systemd создавать каталог при каждом старте: туда пишутся status-файл
+# и management-сокет, без него служба не поднимется.
+RuntimeDirectory=openvpn-server
+RuntimeDirectoryMode=0710
+"""
+
+
+def write_systemd_dropin() -> None:
+    ensure_dir(DROPIN_DIR, 0o755)
+    write_file(os.path.join(DROPIN_DIR, "ovpnctl.conf"), DROPIN, 0o644)
+    daemon_reload()
+
+
+def enable_services() -> None:
+    systemctl("enable", "--now", cfgmod.FIREWALL_UNIT, check=False)
+    systemctl("enable", cfgmod.SERVICE, check=False)
+    systemctl("restart", cfgmod.SERVICE)
+    systemctl("enable", "--now", cfgmod.RENEW_TIMER, check=False)
+
+
+def restart() -> None:
+    systemctl("restart", cfgmod.SERVICE)
+
+
+def reload_crl() -> None:
+    """Обновляем CRL в рабочем каталоге; openvpn перечитает файл сам."""
+    dst = os.path.join(cfgmod.SERVER_DIR, "crl.pem")
+    shutil.copyfile(pki.CRL, dst)
+    os.chmod(dst, 0o644)
+
+
+# --------------------------------------------------------------------------- #
+# Управляющий интерфейс (kill сессий, список онлайна)
+# --------------------------------------------------------------------------- #
+def mgmt_command(command: str, timeout: float = 3.0) -> str:
+    if not os.path.exists(cfgmod.MGMT_SOCKET):
+        raise OvpnError("management-сокет недоступен (сервер запущен?): %s" % cfgmod.MGMT_SOCKET)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(cfgmod.MGMT_SOCKET)
+        sock.sendall((command + "\n").encode())
+        chunks = []
+        try:
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data.decode(errors="replace"))
+                joined = "".join(chunks)
+                if "END" in joined or "SUCCESS:" in joined or "ERROR:" in joined:
+                    break
+        except socket.timeout:
+            pass
+        return "".join(chunks)
+    finally:
+        try:
+            sock.sendall(b"quit\n")
+        except OSError:
+            pass
+        sock.close()
+
+
+def kill_client(name: str) -> bool:
+    try:
+        out = mgmt_command("kill %s" % name)
+    except OvpnError:
+        return False
+    return "SUCCESS" in out
+
+
+def online_clients():
+    """Подключённые клиенты из status-файла (status-version 2).
+
+    Колонки берём из строки HEADER — их состав отличается между версиями OpenVPN.
+    """
+    path = cfgmod.STATUS_FILE
+    if not os.path.exists(path):
+        return []
+    try:
+        body = read_file(path)
+    except OSError:
+        return []
+
+    columns = ["Common Name", "Real Address", "Virtual Address", "Virtual IPv6 Address",
+               "Bytes Received", "Bytes Sent", "Connected Since"]
+    for line in body.splitlines():
+        if line.startswith("HEADER,CLIENT_LIST"):
+            columns = line.split(",")[2:]
+            break
+
+    def field(parts, title, default=""):
+        try:
+            return parts[columns.index(title) + 1]
+        except (ValueError, IndexError):
+            return default
+
+    def number(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    clients = []
+    for line in body.splitlines():
+        parts = line.split(",")
+        if not parts or parts[0] != "CLIENT_LIST":
+            continue
+        clients.append({
+            "name": field(parts, "Common Name"),
+            "real_address": field(parts, "Real Address"),
+            "virtual_address": field(parts, "Virtual Address"),
+            "bytes_received": number(field(parts, "Bytes Received")),
+            "bytes_sent": number(field(parts, "Bytes Sent")),
+            "connected_since": field(parts, "Connected Since"),
+        })
+    return clients
+
+
+def status_summary(cfg: dict) -> dict:
+    return {
+        "service": cfgmod.SERVICE,
+        "active": service_active(cfgmod.SERVICE),
+        "firewall": service_active(cfgmod.FIREWALL_UNIT),
+        "timer": service_active(cfgmod.RENEW_TIMER),
+        "endpoint": "%s:%d/%s" % (cfg["endpoint"], cfg["port"], cfg["proto"]),
+        "online": len(online_clients()),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Валидация параметров
+# --------------------------------------------------------------------------- #
+def validate_cfg(cfg: dict) -> dict:
+    if cfg["proto"] not in ("udp", "tcp"):
+        raise OvpnError("proto должен быть udp или tcp.")
+    port = int(cfg["port"])
+    if not 1 <= port <= 65535:
+        raise OvpnError("порт вне диапазона 1–65535.")
+    cfg["port"] = port
+    try:
+        ipaddress.IPv4Network("%s/%s" % (cfg["subnet"], cfg["netmask"]), strict=False)
+    except ValueError as exc:
+        raise OvpnError("некорректная VPN-подсеть: %s" % exc)
+    if not cfg.get("nic"):
+        cfg["nic"] = default_nic()
+    if cfg.get("key_type") not in ("ec", "rsa"):
+        raise OvpnError("key_type должен быть ec или rsa.")
+    return cfg
+
+
+def setup_networking(cfg: dict) -> None:
+    enable_ip_forward(bool(cfg.get("ipv6")))
+    write_firewall_script(cfg)
+    write_systemd_dropin()
+    configure_ufw(cfg)
