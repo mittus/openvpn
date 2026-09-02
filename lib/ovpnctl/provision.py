@@ -185,7 +185,7 @@ def setup(args) -> None:
     print("  ovpnctl                          — интерактивное меню")
     print("  ovpnctl client add <certname>    — новый клиент")
     print("  ovpnctl client show <certname>   — вывести .ovpn в консоль")
-    print("  ovpnctl client export <certname> — сохранить ~/ovpnctl/<certname>.ovpn")
+    print("  ovpnctl client list              — список клиентов и сроков")
     print("  ovpnctl pki check                — сроки всех сертификатов")
 
 

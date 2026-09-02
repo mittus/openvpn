@@ -154,6 +154,20 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
             return False
 
 
+def clear_screen() -> None:
+    """Очистка экрана перед отрисовкой меню (в не-TTY ничего не делает)."""
+    if IS_TTY:
+        sys.stdout.write("\033[H\033[2J")
+        sys.stdout.flush()
+
+
+def pause(message: str = "Нажмите Enter, чтобы вернуться в меню") -> None:
+    try:
+        input("\n%s%s%s" % (C_DIM, message, C_RESET))
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
 def ask_optional(prompt: str, current=None):
     """Необязательный ввод: пустая строка = оставить как есть (вернёт None)."""
     suffix = " (сейчас %s, Enter — не менять)" % current if current not in (None, "") else " (Enter — пропустить)"

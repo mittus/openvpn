@@ -45,8 +45,6 @@ ovpnctl client add <name>                  # новый клиент + проф�
 ovpnctl client add <name> --days 365 --ip 10.8.0.50
 ovpnctl client list                        # таблица клиентов и сроков
 ovpnctl client show <name>                 # вывести .ovpn в консоль
-ovpnctl client export <name>               # сохранить ~/ovpnctl/<name>.ovpn
-ovpnctl client export <name> /tmp          # или в указанный каталог/файл
 ovpnctl client renew <name>                # продлить сертификат
 ovpnctl client revoke <name>               # отозвать (CRL + разрыв сессии)
 ovpnctl client delete <name>               # отозвать и удалить все файлы
@@ -66,7 +64,7 @@ ovpnctl uninstall [--keep-pki] [--purge]
 ## Файрвол
 
 ```bash
-sudo ovpnctl ufw              # или пункт 15 в меню
+sudo ovpnctl ufw              # или пункт 18 в меню
 sudo ovpnctl ufw --install    # заодно поставить сам пакет ufw
 sudo ovpnctl ufw --ssh        # заодно разрешить порты sshd (из /etc/ssh/sshd_config)
 sudo ovpnctl ufw --remove     # убрать разрешение
@@ -192,7 +190,7 @@ bash tests/network-e2e.sh debian:12
 Прогонялось на **Debian 13 (OpenVPN 2.6.14 / OpenSSL 3.5.1 / Python 3.13)**,
 **Debian 11 (2.5.1 / 1.1.1n / 3.9)** и **Ubuntu 22.04 (2.5.11 / 3.0.2 / 3.10)**:
 52 юнит-проверки, 27 проверок установки (включая переустановку через `uninstall`),
-48 — основного сценария, 23 — ufw-сценария и 11 — сетевого, все зелёные. В том числе
+49 — основного сценария, 23 — ufw-сценария и 11 — сетевого, все зелёные. В том числе
 проверяется главное обещание: после `pki renew --force` (ротация CA + перевыпуск
 серверного сертификата) профиль, выданный **до** ротации, продолжает подключаться.
 

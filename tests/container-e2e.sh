@@ -87,43 +87,46 @@ else
 fi
 chk "у клиента есть tun-интерфейс с адресом 10.8.0.x" "ip -4 addr | grep -q '10\.8\.0\.'"
 chk "пинг до сервера VPN 10.8.0.1" "ping -c 2 -W 3 10.8.0.1"
-echo "  --- выгрузка профилей в личный каталог пользователя ---"
-chk "client add сразу кладёт профиль в ~/ovpnctl" "test -s /root/ovpnctl/phone.ovpn"
+echo "  --- выгрузка профиля в личный каталог пользователя ---"
+chk "client add кладёт профиль в ~/ovpnctl" "test -s /root/ovpnctl/phone.ovpn"
 chk "содержимое совпадает с хранилищем" \
     "[ \"$(md5sum < /root/ovpnctl/phone.ovpn)\" = \"$(md5sum < /etc/ovpnctl/profiles/phone.ovpn)\" ]"
 chk "права профиля 0600" "[ \"$(stat -c %a /root/ovpnctl/phone.ovpn)\" = 600 ]"
 chk "каталог ~/ovpnctl закрыт (0700)" "[ \"$(stat -c %a /root/ovpnctl)\" = 700 ]"
 
-rm -f /root/ovpnctl/phone.ovpn
-( cd /tmp && ovpnctl client export phone >/dev/null 2>&1 )
-chk "export без пути игнорирует текущий каталог и пишет в ~/ovpnctl" \
-    "test -s /root/ovpnctl/phone.ovpn -a ! -e /tmp/phone.ovpn"
-ovpnctl client export phone /tmp/custom >/dev/null 2>&1
-chk "export с явным путём кладёт файл туда" "test -s /tmp/custom"
-mkdir -p /tmp/box && ovpnctl client export phone /tmp/box >/dev/null 2>&1
-chk "export в каталог кладёт /tmp/box/phone.ovpn" "test -s /tmp/box/phone.ovpn"
-
-# эмулируем запуск через sudo: файл должен уйти в дом пользователя и принадлежать ему
+# под sudo профиль должен уходить вызвавшему пользователю, а не root
 useradd -m vpnuser >/dev/null 2>&1
-SUDO_USER=vpnuser ovpnctl client export phone >/dev/null 2>&1
-chk "под sudo профиль уходит в /home/vpnuser/ovpnctl" "test -s /home/vpnuser/ovpnctl/phone.ovpn"
+SUDO_USER=vpnuser ovpnctl client add fromsudo >/dev/null 2>&1
+chk "под sudo профиль уходит в /home/vpnuser/ovpnctl" "test -s /home/vpnuser/ovpnctl/fromsudo.ovpn"
 chk "владелец файла — вызвавший пользователь" \
-    "[ \"$(stat -c %U /home/vpnuser/ovpnctl/phone.ovpn)\" = vpnuser ]"
+    "[ \"$(stat -c %U /home/vpnuser/ovpnctl/fromsudo.ovpn)\" = vpnuser ]"
 chk "владелец каталога — вызвавший пользователь" \
     "[ \"$(stat -c %U /home/vpnuser/ovpnctl)\" = vpnuser ]"
+ovpnctl client delete fromsudo -y >/dev/null 2>&1
 
 echo "  --- ovpnctl online ---"; ovpnctl online
 echo "  --- ovpnctl status (фрагмент) ---"; ovpnctl status 2>&1 | head -14
 
 echo; echo "=== 5б. интерактивное меню (через псевдотерминал) ==="
 if command -v script >/dev/null 2>&1; then
-    printf '2\n9\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu.log 2>&1
-    chk "меню отрисовано рамкой"        "grep -q 'управление OpenVPN' /var/log/menu.log"
-    chk "есть сводка состояния"         "grep -q 'Служба OpenVPN' /var/log/menu.log"
-    chk "приглашение с диапазоном"      "grep -q 'Выберите пункт \[0-' /var/log/menu.log"
+    printf '2\n\n8\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu.log 2>&1
+    chk "меню отрисовано рамкой"          "grep -q 'управление OpenVPN' /var/log/menu.log"
+    chk "есть сводка состояния"           "grep -q 'Служба OpenVPN' /var/log/menu.log"
+    chk "приглашение с диапазоном"        "grep -q 'Выберите пункт \[0-' /var/log/menu.log"
     chk "пункт 2 показал список клиентов" "grep -q 'СТАТУС' /var/log/menu.log"
-    chk "пункт 9 показал статус сервера"  "grep -q 'Точка входа' /var/log/menu.log"
-    printf '6\nphone\nn\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu2.log 2>&1
+    chk "пункт 8 показал таблицу клиентов" "grep -A3 'Всего:' /var/log/menu.log | grep -q 'ИМЯ'"
+    chk "результат ждёт Enter, а не затирается меню" \
+        "grep -q 'вернуться в меню' /var/log/menu.log"
+
+    # выбор клиента списком и возврат в меню пустым вводом
+    printf '3\n1\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu3.log 2>&1
+    chk "клиента можно выбрать номером"   "grep -q 'BEGIN CERTIFICATE' /var/log/menu3.log"
+    printf '5\n\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu4.log 2>&1
+    chk "пустой ввод возвращает в меню"   "grep -q 'Возврат в меню' /var/log/menu4.log"
+    chk "после возврата меню снова на экране" \
+        "[ \"$(grep -c 'Выберите пункт' /var/log/menu4.log)\" -ge 2 ]"
+
+    printf '5\nphone\nn\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu2.log 2>&1
     chk "подтверждение предлагает Y/n"  "grep -q '\[Y/n\]\|\[y/N\]' /var/log/menu2.log"
     chk "ответ n отменил отзыв"         "ovpnctl client list | grep -q 'phone .*офлайн\|phone .*онлайн'"
 else
