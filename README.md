@@ -12,7 +12,7 @@
 ## Установка
 
 ```bash
-sudo bash <(wget -qO- https://raw.githubusercontent.com/mittus/openvpn/master/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/mittus/openvpn/master/install.sh)
 ```
 
 | Параметр | Значение |
@@ -23,14 +23,6 @@ sudo bash <(wget -qO- https://raw.githubusercontent.com/mittus/openvpn/master/in
 | Ключи | EC `prime256v1` |
 | DNS для клиентов | `1.1.1.1`, `1.0.0.1` |
 | Сроки сертификатов | CA 20 лет, сервер и клиенты 10 лет, CRL 10 лет (автопродление) |
-
-Создать клиента:
-
-```bash
-sudo ovpnctl client add <name>
-```
-
-Создаст профиль в домашнем каталоге: `~/ovpnctl/<name>.ovpn`
 
 ---
 
@@ -64,10 +56,10 @@ ovpnctl uninstall [--keep-pki] [--purge]
 ## Файрвол
 
 ```bash
-sudo ovpnctl ufw              # или пункт 18 в меню
-sudo ovpnctl ufw --install    # заодно поставить сам пакет ufw
-sudo ovpnctl ufw --ssh        # заодно разрешить порты sshd (из /etc/ssh/sshd_config)
-sudo ovpnctl ufw --remove     # убрать разрешение
+ovpnctl ufw              # или пункт 18 в меню
+ovpnctl ufw --install    # заодно поставить сам пакет ufw
+ovpnctl ufw --ssh        # заодно разрешить порты sshd (из /etc/ssh/sshd_config)
+ovpnctl ufw --remove     # убрать разрешение
 ```
 
 ---
@@ -213,7 +205,7 @@ bash tests/network-e2e.sh debian:12
 ## Удаление
 
 ```bash
-sudo ovpnctl uninstall            # службы, правила, конфиги (с бэкапом в /root)
-sudo ovpnctl uninstall --purge    # плюс удалить пакет openvpn
-sudo bash uninstall.sh            # то же самое из исходников
+ovpnctl uninstall            # службы, правила, конфиги (с бэкапом в /root)
+ovpnctl uninstall --purge    # плюс удалить пакет openvpn
+bash uninstall.sh            # то же самое из исходников
 ```
