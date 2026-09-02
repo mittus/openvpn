@@ -57,7 +57,17 @@ CA_BEFORE=$(openssl x509 -in /etc/ovpnctl/pki/ca.crt -noout -fingerprint)
 OVPN_REPO_URL=http://127.0.0.1:8000/repo OVPN_REPO_BRANCH=master \
   bash <(cat /src/install.sh) > /var/log/install2.log 2>&1 </dev/null \
   && ok "повторный запуск отработал" || { bad "повторный запуск"; tail -15 /var/log/install2.log; }
-chk "сообщение про обновление кода" "grep -q 'обновлён только код' /var/log/install2.log"
+chk "сообщение про повторный запуск" "grep -q 'сервер не пересоздавался' /var/log/install2.log"
+chk "видно, что код той же сборки"   "grep -q 'Код уже актуален' /var/log/install2.log"
+
+# реальное обновление кода: портим установленный файл и ставим заново
+sed -i 's/ovpnctl — управление OpenVPN/ЗАМЕНЁННЫЙ ЗАГОЛОВОК/' /opt/ovpnctl/lib/ovpnctl/cli.py
+OVPN_REPO_URL=http://127.0.0.1:8000/repo OVPN_REPO_BRANCH=master \
+  bash <(cat /src/install.sh) > /var/log/install-upd.log 2>&1 </dev/null
+chk "изменённый файл заменён свежим" \
+    "! grep -q 'ЗАМЕНЁННЫЙ ЗАГОЛОВОК' /opt/ovpnctl/lib/ovpnctl/cli.py"
+chk "в выводе видно обновление сборки" "grep -q 'Код обновлён: сборка' /var/log/install-upd.log"
+chk "ovpnctl работает после обновления" "ovpnctl --version"
 [ "$CA_BEFORE" = "$(openssl x509 -in /etc/ovpnctl/pki/ca.crt -noout -fingerprint)" ] \
   && ok "PKI не тронут" || bad "PKI перезаписан"
 chk "профиль клиента на месте" "test -s /etc/ovpnctl/profiles/first.ovpn"

@@ -23,6 +23,7 @@ BIN_PATH="/usr/local/bin/ovpnctl"
 ETC_DIR="/etc/ovpnctl"
 LOG_TAG="[ovpnctl-install]"
 TMP_DIR=""                              # временный каталог для скачанных исходников
+CODE_FP_BEFORE=""                       # отпечаток установленного кода до обновления
 
 C_OK=$'\033[1;32m'; C_ERR=$'\033[1;31m'; C_WARN=$'\033[1;33m'; C_INFO=$'\033[1;36m'; C_OFF=$'\033[0m'
 if [ ! -t 1 ]; then C_OK=; C_ERR=; C_WARN=; C_INFO=; C_OFF=; fi
@@ -113,6 +114,14 @@ apt_update_once() {
         DEBIAN_FRONTEND=noninteractive apt-get update -qq || warn "apt-get update завершился с ошибкой, продолжаю с текущими индексами."
         _APT_UPDATED=1
     fi
+}
+
+# Отпечаток кода: по нему видно, обновились ли исходники на самом деле
+code_fingerprint() {
+    local dir="$1"
+    [ -d "$dir" ] || { echo "нет"; return; }
+    find "$dir" -type f -name '*.py' -print0 2>/dev/null \
+        | sort -z | xargs -0 cat 2>/dev/null | md5sum | cut -c1-8
 }
 
 pkg_installed() { dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null | grep -q '^installed$'; }
@@ -219,6 +228,7 @@ fetch_sources() {
 # --------------------------------------------------------------------------- #
 deploy() {
     info "Разворачиваю в $SRC_DIR…"
+    CODE_FP_BEFORE="$(code_fingerprint "$SRC_DIR/lib")"
     install -d -m 0755 "$SRC_DIR" "$ETC_DIR"
     rm -rf "$SRC_DIR/lib"
     cp -a "$PAYLOAD_DIR/lib" "$SRC_DIR/lib"
@@ -245,7 +255,16 @@ WRAP
 
     # ПЕРЕПРОВЕРКА: менеджер реально запускается
     "$BIN_PATH" --version >/dev/null 2>&1 || die "менеджер ovpnctl не запускается после установки."
-    ok "Файлы разложены, команда доступна как: ovpnctl ($("$BIN_PATH" --version))"
+
+    local fp_after
+    fp_after="$(code_fingerprint "$SRC_DIR/lib")"
+    if [ "$CODE_FP_BEFORE" = "нет" ]; then
+        ok "Файлы разложены ($("$BIN_PATH" --version), сборка $fp_after)"
+    elif [ "$CODE_FP_BEFORE" = "$fp_after" ]; then
+        ok "Код уже актуален — та же сборка $fp_after, обновлять нечего."
+    else
+        ok "Код обновлён: сборка $CODE_FP_BEFORE → $fp_after"
+    fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -254,8 +273,10 @@ WRAP
 run_setup() {
     # Повторный запуск на уже настроенном сервере = обновление кода без переустановки
     if [ -f "$ETC_DIR/config.json" ]; then
-        ok "Найдена существующая конфигурация ($ETC_DIR/config.json) — обновлён только код."
-        info "Применить обновление к серверу:  ovpnctl server rebuild"
+        ok "Найдена существующая конфигурация ($ETC_DIR/config.json) — сервер не пересоздавался."
+        info "Меню открыто в другой сессии? Выйдите из него (0) и запустите 'ovpnctl' заново —"
+        info "уже запущенный процесс работает со старым кодом."
+        info "Применить обновление к конфигу:  ovpnctl server rebuild"
         info "Поставить заново с нуля:         ovpnctl uninstall -y, затем эта же команда"
         "$BIN_PATH" status || true
         return 0
