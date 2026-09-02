@@ -6,6 +6,7 @@ export DEBIAN_FRONTEND=noninteractive
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); echo "  [ok]   $1"; }
 bad(){ FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+skip(){ echo "  [skip] $1"; }
 chk(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
 echo "=== система: $(. /etc/os-release; echo "$PRETTY_NAME") ==="
@@ -113,6 +114,21 @@ chk "владелец каталога — вызвавший пользоват
 
 echo "  --- ovpnctl online ---"; ovpnctl online
 echo "  --- ovpnctl status (фрагмент) ---"; ovpnctl status 2>&1 | head -14
+
+echo; echo "=== 5б. интерактивное меню (через псевдотерминал) ==="
+if command -v script >/dev/null 2>&1; then
+    printf '2\n9\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu.log 2>&1
+    chk "меню отрисовано рамкой"        "grep -q 'управление OpenVPN' /var/log/menu.log"
+    chk "есть сводка состояния"         "grep -q 'Служба OpenVPN' /var/log/menu.log"
+    chk "приглашение с диапазоном"      "grep -q 'Выберите пункт \[0-' /var/log/menu.log"
+    chk "пункт 2 показал список клиентов" "grep -q 'СТАТУС' /var/log/menu.log"
+    chk "пункт 9 показал статус сервера"  "grep -q 'Точка входа' /var/log/menu.log"
+    printf '6\nphone\nn\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu2.log 2>&1
+    chk "подтверждение предлагает Y/n"  "grep -q '\[Y/n\]\|\[y/N\]' /var/log/menu2.log"
+    chk "ответ n отменил отзыв"         "ovpnctl client list | grep -q 'phone .*офлайн\|phone .*онлайн'"
+else
+    skip "утилита script недоступна — меню не проверено"
+fi
 
 echo; echo "=== 6. отзыв доступа ==="
 ovpnctl client revoke phone -y >/dev/null 2>&1 && ok "client revoke отработал" || bad "client revoke"

@@ -140,7 +140,7 @@ def ask(prompt: str, default=None, validator=None):
 
 
 def ask_yes_no(prompt: str, default: bool = True) -> bool:
-    hint = "Д/н" if default else "д/Н"
+    hint = "Y/n" if default else "y/N"
     while True:
         try:
             raw = input("%s [%s]: " % (prompt, hint)).strip().lower()
@@ -152,6 +152,16 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
             return True
         if raw in ("n", "no", "н", "нет", "0"):
             return False
+
+
+def ask_optional(prompt: str, current=None):
+    """Необязательный ввод: пустая строка = оставить как есть (вернёт None)."""
+    suffix = " (сейчас %s, Enter — не менять)" % current if current not in (None, "") else " (Enter — пропустить)"
+    try:
+        raw = input("%s%s: " % (prompt, suffix)).strip()
+    except EOFError:
+        return None
+    return raw or None
 
 
 def table(rows, headers) -> str:

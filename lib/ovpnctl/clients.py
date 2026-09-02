@@ -11,9 +11,7 @@ from . import pki
 from . import server as srv
 from .util import OvpnError, ensure_dir, read_file, warn, write_file
 
-PROFILE_HEADER = """# Профиль OpenVPN для клиента «{name}» (ovpnctl)
-# Сертификат действует до {expires}.
-client
+PROFILE_HEADER = """client
 dev {dev}
 proto {proto}
 remote {endpoint} {port}
@@ -25,8 +23,6 @@ remote-cert-tls server
 auth {auth}
 tls-version-min 1.2
 verb 3
-
-# Опции ниже безопасно игнорируются старыми клиентами (setenv opt)
 setenv opt data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 setenv opt data-ciphers-fallback AES-256-GCM
 setenv opt cipher AES-256-GCM
@@ -51,8 +47,6 @@ def profile_text(name: str, cfg: dict) -> str:
         raise OvpnError("нет приватного ключа клиента '%s' (профиль не восстановить)." % name)
 
     head = PROFILE_HEADER.format(
-        name=name,
-        expires=pki.not_after(crt).strftime("%Y-%m-%d"),
         dev=cfg.get("dev", "tun"),
         proto=cfg["proto"],
         endpoint=cfg["endpoint"],

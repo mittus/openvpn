@@ -17,13 +17,19 @@ from .system import (
     give_to_user,
     run,
     service_active,
+    service_enabled,
     system_facts,
     systemctl,
     user_output_dir,
 )
 from .util import (
+    C_CYAN,
+    C_GREEN,
+    C_RED,
+    C_RESET,
     OvpnError,
     ask,
+    ask_optional,
     ask_yes_no,
     bold,
     dim,
@@ -468,23 +474,87 @@ def cmd_doctor(args) -> int:
 # --------------------------------------------------------------------------- #
 # Интерактивное меню
 # --------------------------------------------------------------------------- #
-MENU = """
-{title}
-  1) Статус сервера                 9)  Продлить всё, чему пора
-  2) Список клиентов                10) Проверить сроки сертификатов
-  3) Добавить клиента               11) Диагностика (doctor)
-  4) Показать .ovpn в консоли       12) Перезапустить OpenVPN
-  5) Сохранить .ovpn к себе         13) Логи сервера
-  6) Отозвать клиента               14) Резервная копия
-  7) Удалить клиента                15) Пересобрать конфигурацию
-  8) Кто сейчас онлайн              16) Открыть порт VPN в ufw
-  0) Выход
-"""
-
-
 class _Args(object):
+    """Лёгкая замена argparse.Namespace для вызова команд из меню."""
+
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+
+
+MENU_SECTIONS = [
+    [
+        (1, "Добавить клиента"),
+        (2, "Список клиентов"),
+        (3, "Показать .ovpn в консоли"),
+        (4, "Сохранить .ovpn к себе"),
+        (5, "Продлить сертификат клиента"),
+        (6, "Отозвать клиента"),
+        (7, "Удалить клиента"),
+        (8, "Закрепить IP за клиентом"),
+    ],
+    [
+        (9, "Статус сервера"),
+        (10, "Кто сейчас онлайн"),
+        (11, "Перезапустить OpenVPN"),
+        (12, "Логи сервера"),
+        (13, "Пересобрать конфигурацию"),
+        (14, "Изменить адрес, порт или DNS"),
+    ],
+    [
+        (15, "Проверить сроки сертификатов"),
+        (16, "Продлить всё, чему пора"),
+    ],
+    [
+        (17, "Диагностика (doctor)"),
+        (18, "Резервная копия"),
+        (19, "Открыть порт VPN в ufw"),
+    ],
+]
+
+MENU_WIDTH = 52
+MENU_MAX = max(num for section in MENU_SECTIONS for num, _ in section)
+
+
+def _box_row(plain: str, colored: str = None) -> str:
+    """Строка рамки: ширина считается по тексту без ANSI-последовательностей."""
+    pad = " " * max(0, MENU_WIDTH - len(plain))
+    return "%s%s%s%s%s" % (C_CYAN, "│" + C_RESET, colored or plain, pad, C_CYAN + "│" + C_RESET)
+
+
+def _menu_item(num: int, text: str) -> str:
+    plain = "  %s. %s" % (str(num).rjust(2), text)
+    colored = "  %s%s.%s %s" % (C_GREEN, str(num).rjust(2), C_RESET, text)
+    return _box_row(plain, colored)
+
+
+def render_menu() -> str:
+    edge = "─" * MENU_WIDTH
+    title = "ovpnctl %s — управление OpenVPN" % __version__
+    lines = ["%s┌%s┐%s" % (C_CYAN, edge, C_RESET)]
+    lines.append(_box_row(title.center(MENU_WIDTH), C_GREEN + title.center(MENU_WIDTH) + C_RESET))
+    lines.append(_menu_item(0, "Выход"))
+    for section in MENU_SECTIONS:
+        lines.append("%s├%s┤%s" % (C_CYAN, edge, C_RESET))
+        for num, text in section:
+            lines.append(_menu_item(num, text))
+    lines.append("%s└%s┘%s" % (C_CYAN, edge, C_RESET))
+    return "\n".join(lines)
+
+
+def render_state(cfg: dict) -> str:
+    """Сводка состояния под меню — как строки Panel state у 3x-ui."""
+    def mark(flag, yes="работает", no="остановлен"):
+        return "%s%s%s" % (C_GREEN if flag else C_RED, yes if flag else no, C_RESET)
+
+    online = len(srv.online_clients())
+    total = len([c for c in clients.listing(cfg) if c["status"] != "отозван"])
+    return "\n".join([
+        "Служба OpenVPN: %s" % mark(service_active(cfgmod.SERVICE)),
+        "Автозапуск: %s" % mark(service_enabled(cfgmod.SERVICE), "включён", "выключен"),
+        "Автопродление: %s" % mark(service_active(cfgmod.RENEW_TIMER), "активно", "выключено"),
+        "Точка входа: %s%s:%d/%s%s" % (C_GREEN, cfg["endpoint"], cfg["port"], cfg["proto"], C_RESET),
+        "Клиентов: %d, онлайн: %d" % (total, online),
+    ])
 
 
 def menu(args) -> int:
@@ -493,12 +563,16 @@ def menu(args) -> int:
                         "(ovpnctl --help).")
     if not cfgmod.config_exists():
         raise OvpnError("сервер не настроен — выполните: ovpnctl setup")
-    cfg = cfgmod.load()
+
     while True:
-        title = bold("ovpnctl %s — %s:%d/%s" % (__version__, cfg["endpoint"], cfg["port"], cfg["proto"]))
-        print(MENU.format(title=title))
+        cfg = cfgmod.load()
+        print()
+        print(render_menu())
+        print()
+        print(render_state(cfg))
+        print()
         try:
-            choice = input("Выбор: ").strip()
+            choice = input("Выберите пункт [0-%d]: " % MENU_MAX).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -506,55 +580,69 @@ def menu(args) -> int:
         try:
             if choice == "0":
                 return 0
-            elif choice == "1":
-                cmd_status(_Args(json=False))
-            elif choice == "2":
-                cmd_client_list(_Args(json=False))
-            elif choice == "3":
-                name = ask("Имя клиента (certname)")
-                days = ask("Срок сертификата, дней", cfg["client_days"], int)
-                cmd_client_add(_Args(name=name, days=days, ip=None, print_profile=False))
-            elif choice == "4":
-                cmd_client_show(_Args(name=ask("Имя клиента (certname)"), path=False))
-            elif choice == "5":
-                name = ask("Имя клиента (certname)")
-                cmd_client_export(_Args(name=name, output=None))
-            elif choice == "6":
-                cmd_client_revoke(_Args(name=ask("Имя клиента (certname)"), yes=False))
-            elif choice == "7":
-                cmd_client_delete(_Args(name=ask("Имя клиента (certname)"), yes=False))
-            elif choice == "8":
-                cmd_online(_Args(json=False))
-            elif choice == "9":
-                cmd_pki_renew(_Args(force=False, quiet=False))
-            elif choice == "10":
-                cmd_pki_check(_Args(json=False))
-            elif choice == "11":
-                cmd_doctor(_Args())
-            elif choice == "12":
-                cmd_server(_Args(action="restart", lines=50))
-            elif choice == "13":
-                cmd_server(_Args(action="logs", lines=50))
-            elif choice == "14":
-                cmd_backup(_Args(output=None))
-            elif choice == "15":
-                cmd_server(_Args(action="rebuild", lines=50))
-            elif choice == "16":
-                install_ufw = False
-                if not srv.ufw_available():
-                    warn("ufw не установлен.")
-                    install_ufw = ask_yes_no("Установить ufw сейчас?", True)
-                    if not install_ufw:
-                        raise OvpnError("без ufw настраивать нечего.")
-                with_ssh = ask_yes_no("Заодно разрешить SSH (чтобы не потерять доступ)?", True)
-                cmd_ufw(_Args(install=install_ufw, remove=False, ssh=with_ssh))
+            handler = MENU_ACTIONS.get(choice)
+            if handler is None:
+                warn("Нет такого пункта: %s" % (choice or "—"))
             else:
-                warn("Неизвестный пункт меню.")
+                handler(cfg)
         except OvpnError as exc:
             err("Ошибка: %s" % exc)
         except KeyboardInterrupt:
             print()
         print()
+
+
+def _menu_change_settings(cfg: dict) -> None:
+    endpoint = ask_optional("Адрес сервера (домен или IP)", cfg["endpoint"])
+    port = ask_optional("Порт", cfg["port"])
+    proto = ask_optional("Протокол (udp/tcp)", cfg["proto"])
+    dns = ask_optional("DNS через запятую", ", ".join(cfg["dns"]))
+    if not any([endpoint, port, proto, dns]):
+        info("Ничего не изменено.")
+        return
+    cmd_set(_Args(endpoint=endpoint, port=int(port) if port else None,
+                  proto=proto, dns=dns, nic=None))
+
+
+def _menu_ufw(cfg: dict) -> None:
+    install_ufw = False
+    if not srv.ufw_available():
+        warn("ufw не установлен.")
+        install_ufw = ask_yes_no("Установить ufw сейчас?", True)
+        if not install_ufw:
+            raise OvpnError("без ufw настраивать нечего.")
+    with_ssh = ask_yes_no("Заодно разрешить SSH (чтобы не потерять доступ)?", True)
+    cmd_ufw(_Args(install=install_ufw, remove=False, ssh=with_ssh))
+
+
+def _ask_client() -> str:
+    return ask("Имя клиента")
+
+
+MENU_ACTIONS = {
+    "1": lambda cfg: cmd_client_add(_Args(
+        name=ask("Имя нового клиента"),
+        days=ask("Срок сертификата, дней", cfg["client_days"], int),
+        ip=None, print_profile=False)),
+    "2": lambda cfg: cmd_client_list(_Args(json=False)),
+    "3": lambda cfg: cmd_client_show(_Args(name=_ask_client(), path=False)),
+    "4": lambda cfg: cmd_client_export(_Args(name=_ask_client(), output=None)),
+    "5": lambda cfg: cmd_client_renew(_Args(name=_ask_client(), days=None, new_key=False)),
+    "6": lambda cfg: cmd_client_revoke(_Args(name=_ask_client(), yes=False)),
+    "7": lambda cfg: cmd_client_delete(_Args(name=_ask_client(), yes=False)),
+    "8": lambda cfg: cmd_client_ip(_Args(name=_ask_client(), address=ask("Адрес в VPN-подсети"))),
+    "9": lambda cfg: cmd_status(_Args(json=False)),
+    "10": lambda cfg: cmd_online(_Args(json=False)),
+    "11": lambda cfg: cmd_server(_Args(action="restart", lines=50)),
+    "12": lambda cfg: cmd_server(_Args(action="logs", lines=50)),
+    "13": lambda cfg: cmd_server(_Args(action="rebuild", lines=50)),
+    "14": _menu_change_settings,
+    "15": lambda cfg: cmd_pki_check(_Args(json=False)),
+    "16": lambda cfg: cmd_pki_renew(_Args(force=False, quiet=False)),
+    "17": lambda cfg: cmd_doctor(_Args()),
+    "18": lambda cfg: cmd_backup(_Args(output=None)),
+    "19": _menu_ufw,
+}
 
 
 # --------------------------------------------------------------------------- #
