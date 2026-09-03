@@ -8,12 +8,13 @@ PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); echo "  [ok]   $1"; }
 bad(){ FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 chk(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+skip(){ echo "  [skip] $1"; }
 
 echo "=== система: $(. /etc/os-release; echo "$PRETTY_NAME") ==="
 mkdir -p /run/systemd/system
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/systemctl; chmod +x /usr/local/bin/systemctl; hash -r
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq --no-install-recommends python3 tar iproute2 >/dev/null 2>&1
+apt-get install -y -qq --no-install-recommends python3 tar iproute2 bsdextrautils util-linux >/dev/null 2>&1
 
 # занимаем 10.8.0.0/24, чтобы проверить автоподбор свободной VPN-подсети
 ip link add dummy0 type dummy 2>/dev/null && ip addr add 10.8.0.1/24 dev dummy0 2>/dev/null \
@@ -72,6 +73,54 @@ chk "ovpnctl работает после обновления" "ovpnctl --versio
   && ok "PKI не тронут" || bad "PKI перезаписан"
 chk "профиль клиента на месте" "test -s /etc/ovpnctl/profiles/first.ovpn"
 
+echo; echo "=== сервер, где OpenVPN уже стоял вручную ==="
+cp /src/install.sh /tmp/install.sh
+ENVV="OVPN_REPO_URL=http://127.0.0.1:8000/repo OVPN_REPO_BRANCH=master"
+make_old() {
+    mkdir -p /etc/openvpn/server
+    printf 'port 1194\nproto udp\ndev tun\n' > /etc/openvpn/server/manual.conf
+    printf 'port 1194\n' > /etc/openvpn/old-style.conf
+}
+
+# --- без терминала: ничего не трогаем, только предупреждаем ---
+ovpnctl uninstall -y >/dev/null 2>&1; make_old
+env $ENVV bash /tmp/install.sh > /var/log/install-over.log 2>&1 </dev/null \
+  && ok "установка поверх ручной прошла" || { bad "установка поверх ручной"; tail -15 /var/log/install-over.log; }
+chk "предупреждение про прежнюю конфигурацию" \
+    "grep -q 'Обнаружена прежняя конфигурация OpenVPN' /var/log/install-over.log"
+chk "чужие конфиги перечислены"        "grep -q 'manual.conf' /var/log/install-over.log"
+chk "сделана резервная копия /etc/openvpn" \
+    "ls /etc/ovpnctl/backup/openvpn-before-ovpnctl-*.tar.gz"
+chk "без терминала чужой конфиг не тронут" "test -f /etc/openvpn/server/manual.conf"
+chk "наш сервер настроен"              "test -f /etc/openvpn/server/server.conf"
+
+if command -v script >/dev/null 2>&1; then
+    # --- ответ Y: прежний сервер убираем, ставим на стандартных параметрах ---
+    ip link delete dummy0 2>/dev/null || true   # освобождаем 10.8.0.0/24, занятый в начале теста
+    ovpnctl uninstall -y >/dev/null 2>&1; make_old
+    printf 'y\n' | script -qec "env $ENVV bash /tmp/install.sh" /dev/null > /var/log/install-y.log 2>&1
+    chk "предложено удалить прежний сервер" \
+        "grep -q 'Удалить прежний сервер' /var/log/install-y.log"
+    chk "прежние конфиги убраны из /etc/openvpn" \
+        "! test -f /etc/openvpn/server/manual.conf -o -f /etc/openvpn/old-style.conf"
+    chk "конфиги сохранены в архиве"   "ls -d /etc/ovpnctl/backup/previous-openvpn-*"
+    chk "порт стандартный 1194"        "grep -q '\"port\": 1194' /etc/ovpnctl/config.json"
+    chk "подсеть стандартная 10.8.0.0" "grep -q '\"subnet\": \"10.8.0.0\"' /etc/ovpnctl/config.json"
+    chk "сервер поставлен"             "test -f /etc/openvpn/server/server.conf"
+    ovpnctl client add clean >/dev/null 2>&1
+    chk "клиент выпускается после переезда" "test -s /etc/ovpnctl/profiles/clean.ovpn"
+
+    # --- ответ N, затем смена порта у нового сервера ---
+    ovpnctl uninstall -y >/dev/null 2>&1; make_old
+    printf 'n\nn\n1195\n' | script -qec "env $ENVV bash /tmp/install.sh" /dev/null > /var/log/install-n.log 2>&1
+    chk "предложена смена порта"       "grep -q 'Порт для нового сервера' /var/log/install-n.log"
+    chk "новый сервер встал на 1195"   "grep -q '\"port\": 1195' /etc/ovpnctl/config.json"
+    chk "прежние конфиги остались на месте" "test -f /etc/openvpn/server/manual.conf"
+    rm -f /etc/openvpn/server/manual.conf /etc/openvpn/old-style.conf
+else
+    skip "утилита script недоступна — интерактивные ветки не проверены"
+fi
+
 echo; echo "=== установка поверх настроенного сервера запрещена ==="
 ovpnctl setup >/var/log/setup-again.log 2>&1 && bad "setup согласился поставить поверх" \
     || ok "setup отказывается ставить поверх"
@@ -87,6 +136,8 @@ OVPN_REPO_URL=http://127.0.0.1:8000/repo OVPN_REPO_BRANCH=master \
   && ok "повторная установка с нуля прошла" || { bad "повторная установка"; tail -15 /var/log/install3.log; }
 [ "$CA_OLD" != "$(openssl x509 -in /etc/ovpnctl/pki/ca.crt -noout -fingerprint)" ] \
   && ok "создан новый CA (чистая установка)" || bad "CA остался прежним"
+chk "свой прежний конфиг не считается чужим" \
+    "! grep -q 'Обнаружена прежняя конфигурация' /var/log/install3.log"
 
 echo; echo "============================================================"
 echo "ИТОГ: пройдено $PASS, провалено $FAIL"

@@ -75,7 +75,11 @@ chk "нет ошибок в логе сервера" "! grep -qiE '^Options erro
 grep -E 'Initialization Sequence|OpenVPN 2|Diffie|Control Channel' /var/log/ovpn-server.log | tail -4
 
 echo; echo "=== 5. подключение настоящего клиента по .ovpn ==="
-ovpnctl client add phone >/dev/null 2>&1 && ok "ovpnctl client add phone" || bad "ovpnctl client add phone"
+ovpnctl client add phone > /var/log/add.log 2>&1 && ok "ovpnctl client add phone" || bad "ovpnctl client add phone"
+sed 's/^/    /' /var/log/add.log
+chk "в выводе один путь — в каталоге пользователя" "grep -q 'Профиль: /root/ovpnctl/phone.ovpn' /var/log/add.log"
+chk "лишних подсказок нет" "! grep -qE 'Хранилище|scp|cat ' /var/log/add.log"
+chk "в выводе ровно одна строка с путём" "[ \"$(grep -c '/root/ovpnctl/phone.ovpn' /var/log/add.log)\" = 1 ]"
 cp /etc/ovpnctl/profiles/phone.ovpn /root/phone-backup.ovpn
 openvpn --config /etc/ovpnctl/profiles/phone.ovpn --route-nopull --daemon \
         --log /var/log/ovpn-client.log
@@ -104,23 +108,45 @@ chk "владелец каталога — вызвавший пользоват
     "[ \"$(stat -c %U /home/vpnuser/ovpnctl)\" = vpnuser ]"
 ovpnctl client delete fromsudo -y >/dev/null 2>&1
 
+chk "в списке клиентов виден адрес подключённого" \
+    "ovpnctl client list | grep phone | grep -qE '10\\.8\\.0\\.[0-9]+'"
+echo "  --- ovpnctl client list ---"; ovpnctl client list
 echo "  --- ovpnctl online ---"; ovpnctl online
 echo "  --- ovpnctl status (фрагмент) ---"; ovpnctl status 2>&1 | head -14
 
 echo; echo "=== 5б. интерактивное меню (через псевдотерминал) ==="
 if command -v script >/dev/null 2>&1; then
-    printf '2\n\n8\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu.log 2>&1
+    printf '2\n\n\n7\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu.log 2>&1
     chk "меню отрисовано рамкой"          "grep -q 'управление OpenVPN' /var/log/menu.log"
     chk "есть сводка состояния"           "grep -q 'Служба OpenVPN' /var/log/menu.log"
     chk "приглашение с диапазоном"        "grep -q 'Выберите пункт \[0-' /var/log/menu.log"
     chk "пункт 2 показал список клиентов" "grep -q 'СТАТУС' /var/log/menu.log"
-    chk "пункт 8 показал таблицу клиентов" "grep -A3 'Всего:' /var/log/menu.log | grep -q 'ИМЯ'"
+    chk "в списке есть колонка АДРЕС"     "grep -q 'АДРЕС' /var/log/menu.log"
+    chk "после списка предлагают вывести .ovpn" \
+        "grep -q 'Вывести .ovpn клиента' /var/log/menu.log"
+    chk "пункт 7 показал статус сервера"  "grep -q 'Точка входа' /var/log/menu.log"
     chk "результат ждёт Enter, а не затирается меню" \
         "grep -q 'вернуться в меню' /var/log/menu.log"
+    chk "пункта показа .ovpn в меню больше нет" \
+        "! grep -q 'Показать .ovpn в консоли' /var/log/menu.log"
+    chk "пункт 'Клиенты онлайн' на третьем месте" \
+        "grep -qE '3\\. Клиенты онлайн' /var/log/menu.log"
+    chk "отзыва в меню нет"               "! grep -q 'Отозвать клиента' /var/log/menu.log"
+    chk "команда revoke осталась в CLI"   "ovpnctl client revoke --help"
 
-    # выбор клиента списком и возврат в меню пустым вводом
-    printf '3\n1\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu3.log 2>&1
-    chk "клиента можно выбрать номером"   "grep -q 'BEGIN CERTIFICATE' /var/log/menu3.log"
+    # выбор клиента номером прямо из списка выводит его профиль
+    printf '2\n1\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu3.log 2>&1
+    chk "профиль выводится по номеру из списка" "grep -q 'BEGIN CERTIFICATE' /var/log/menu3.log"
+
+    # создание клиента спрашивает только имя
+    printf '1\nmenuclient\nn\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu5.log 2>&1
+    chk "клиент создан из меню"           "test -s /etc/ovpnctl/profiles/menuclient.ovpn"
+    chk "при создании спрашивают только имя" \
+        "! grep -qE 'Срок сертификата|Закрепить адрес' /var/log/menu5.log"
+    chk "после создания предлагают вывести профиль" \
+        "grep -q 'Вывести профиль на экран' /var/log/menu5.log"
+    ovpnctl client delete menuclient -y >/dev/null 2>&1
+
     printf '5\n\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu4.log 2>&1
     chk "пустой ввод возвращает в меню"   "grep -q 'Возврат в меню' /var/log/menu4.log"
     chk "после возврата меню снова на экране" \
@@ -128,7 +154,7 @@ if command -v script >/dev/null 2>&1; then
 
     printf '5\nphone\nn\n\n0\n' | script -qec "ovpnctl" /dev/null > /var/log/menu2.log 2>&1
     chk "подтверждение предлагает Y/n"  "grep -q '\[Y/n\]\|\[y/N\]' /var/log/menu2.log"
-    chk "ответ n отменил отзыв"         "ovpnctl client list | grep -q 'phone .*офлайн\|phone .*онлайн'"
+    chk "ответ n отменил удаление"      "ovpnctl client list | grep -q 'phone .*офлайн\|phone .*онлайн'"
 else
     skip "утилита script недоступна — меню не проверено"
 fi

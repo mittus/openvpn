@@ -56,7 +56,7 @@ ovpnctl uninstall [--keep-pki] [--purge]
 ## Файрвол
 
 ```bash
-ovpnctl ufw              # или пункт 18 в меню
+ovpnctl ufw              # или пункт 16 в меню
 ovpnctl ufw --install    # заодно поставить сам пакет ufw
 ovpnctl ufw --ssh        # заодно разрешить порты sshd (из /etc/ssh/sshd_config)
 ovpnctl ufw --remove     # убрать разрешение

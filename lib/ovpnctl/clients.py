@@ -206,27 +206,49 @@ def set_static_ip(name: str, address: str, cfg: dict) -> str:
     return path
 
 
+def known_addresses() -> dict:
+    """Адреса, выданные клиентам ранее (ifconfig-pool-persist)."""
+    result = {}
+    path = srv.IPP_FILE
+    if not os.path.exists(path):
+        return result
+    try:
+        body = read_file(path)
+    except OSError:
+        return result
+    for line in body.splitlines():
+        parts = line.split(",")
+        if len(parts) >= 2 and parts[1].strip():
+            result[parts[0].strip()] = parts[1].strip()
+    return result
+
+
 def listing(cfg: dict) -> list:
-    """Сводка по всем клиентам с актуальными сроками."""
+    """Сводка по всем клиентам с актуальными сроками и адресами."""
     db = pki.db_load()
-    online = {c["name"] for c in srv.online_clients()}
+    online = {c["name"]: c.get("virtual_address", "") for c in srv.online_clients()}
+    pool = known_addresses()
     rows = []
     for name in sorted(db["clients"]):
         meta = db["clients"][name]
-        status = "отозван" if meta.get("revoked") else ("онлайн" if name in online else "офлайн")
+        revoked = bool(meta.get("revoked"))
+        status = "отозван" if revoked else ("онлайн" if name in online else "офлайн")
         left = None
         expires = meta.get("expires", "")
-        if not meta.get("revoked") and pki.exists(name):
+        if not revoked and pki.exists(name):
             left = pki.days_left(pki.cert_path(name))
             expires = pki.not_after(pki.cert_path(name)).strftime("%Y-%m-%d")
             if left < 0:
                 status = "истёк"
+        # что показать в колонке адреса: закреплённый → текущий → последний выданный
+        address = meta.get("static_ip") or online.get(name) or pool.get(name, "")
         rows.append({
             "name": name,
             "status": status,
             "expires": expires[:10],
             "days_left": left,
             "static_ip": meta.get("static_ip", ""),
+            "address": address,
             "created": meta.get("created", "")[:10],
         })
     return rows

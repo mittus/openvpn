@@ -341,6 +341,31 @@ def give_to_user(path: str) -> str:
     return path
 
 
+def is_openvpn_server_unit(name: str) -> bool:
+    """Юнит серверного OpenVPN? Клиентские (openvpn-client@…) не трогаем:
+    на сервере может стоять свой VPN-клиент, и он к нашей установке не относится."""
+    if not name.endswith(".service"):
+        return False
+    if name.startswith("openvpn-client@"):
+        return False
+    return (name == "openvpn.service"
+            or name.startswith("openvpn@")
+            or name.startswith("openvpn-server@"))
+
+
+def running_openvpn_units(exclude: str = "") -> list:
+    """Активные службы серверного OpenVPN, кроме нашей — признак прежней установки."""
+    proc = run(["systemctl", "list-units", "--type=service", "--state=active",
+                "--plain", "--no-legend", "openvpn*.service"], check=False)
+    units = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        name = parts[0] if parts else ""
+        if name and name != exclude and is_openvpn_server_unit(name):
+            units.append(name)
+    return units
+
+
 def system_facts() -> dict:
     dist = distro()
     return {

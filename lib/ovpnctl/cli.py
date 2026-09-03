@@ -58,16 +58,12 @@ def human_bytes(num: float) -> str:
 def cmd_client_add(args) -> int:
     cfg = cfgmod.load()
     result = clients.add(args.name, cfg, days=args.days, static_ip=args.ip)
-    copy = export_profile(args.name, cfg)
+    profile = export_profile(args.name, cfg)
     ok("Клиент '%s' создан (сертификат действует до %s)." % (args.name, result["expires"][:10]))
-    print("  Профиль:   %s" % copy)
-    print(dim("  Хранилище: %s" % result["profile"]))
+    print("  Профиль: %s" % profile)
     if args.print_profile:
         print()
-        print(open(copy).read())
-    else:
-        print(dim("  Забрать к себе: scp %s@%s:%s ."
-                  % (os.environ.get("SUDO_USER") or "root", cfg["endpoint"], copy)))
+        sys.stdout.write(open(profile).read())
     return 0
 
 
@@ -98,10 +94,10 @@ def cmd_client_list(args) -> int:
     printable = [
         [r["name"], r["status"], r["expires"],
          "—" if r["days_left"] is None else str(r["days_left"]),
-         r["static_ip"] or "—", r["created"]]
+         r["address"] or "—", r["created"]]
         for r in rows
     ]
-    print(table(printable, ["ИМЯ", "СТАТУС", "ДО", "ДНЕЙ", "IP", "СОЗДАН"]))
+    print(table(printable, ["ИМЯ", "СТАТУС", "ДО", "ДНЕЙ", "АДРЕС", "СОЗДАН"]))
     return 0
 
 
@@ -200,9 +196,9 @@ def cmd_status(args) -> int:
         shown = all_clients[:20]
         rows = [[c["name"], c["status"], c["expires"],
                  "—" if c["days_left"] is None else str(c["days_left"]),
-                 c["static_ip"] or "—"] for c in shown]
+                 c["address"] or "—"] for c in shown]
         print()
-        print(table(rows, ["ИМЯ", "СТАТУС", "ДО", "ДНЕЙ", "IP"]))
+        print(table(rows, ["ИМЯ", "СТАТУС", "ДО", "ДНЕЙ", "АДРЕС"]))
         if len(all_clients) > len(shown):
             print(dim("  …ещё %d — смотрите 'ovpnctl client list'" % (len(all_clients) - len(shown))))
     if online:
@@ -232,7 +228,7 @@ def cmd_online(args) -> int:
     rows = [[c["name"], c["virtual_address"], c["real_address"],
              human_bytes(c["bytes_received"]), human_bytes(c["bytes_sent"]), c["connected_since"]]
             for c in online]
-    print(table(rows, ["ИМЯ", "VPN IP", "АДРЕС", "ПРИНЯТО", "ОТПРАВЛЕНО", "ПОДКЛЮЧЁН С"]))
+    print(table(rows, ["ИМЯ", "АДРЕС В VPN", "ОТКУДА", "ПРИНЯТО", "ОТПРАВЛЕНО", "ПОДКЛЮЧЁН С"]))
     return 0
 
 
@@ -490,29 +486,27 @@ class _Args(object):
 MENU_SECTIONS = [
     [
         (1, "Добавить клиента"),
-        (2, "Список клиентов"),
-        (3, "Показать .ovpn в консоли"),
+        (2, "Список клиентов и выгрузка .ovpn"),
+        (3, "Клиенты онлайн"),
         (4, "Продлить сертификат клиента"),
-        (5, "Отозвать клиента"),
-        (6, "Удалить клиента"),
-        (7, "Закрепить IP за клиентом"),
+        (5, "Удалить клиента"),
+        (6, "Закрепить IP за клиентом"),
     ],
     [
-        (8, "Статус сервера"),
-        (9, "Кто сейчас онлайн"),
-        (10, "Перезапустить OpenVPN"),
-        (11, "Логи сервера"),
-        (12, "Пересобрать конфигурацию"),
-        (13, "Изменить адрес, порт или DNS"),
+        (7, "Статус сервера"),
+        (8, "Перезапустить OpenVPN"),
+        (9, "Логи сервера"),
+        (10, "Пересобрать конфигурацию"),
+        (11, "Изменить адрес, порт или DNS"),
     ],
     [
-        (14, "Проверить сроки сертификатов"),
-        (15, "Продлить всё, чему пора"),
+        (12, "Проверить сроки сертификатов"),
+        (13, "Продлить всё, чему пора"),
     ],
     [
-        (16, "Диагностика (doctor)"),
-        (17, "Резервная копия"),
-        (18, "Открыть порт VPN в ufw"),
+        (14, "Диагностика (doctor)"),
+        (15, "Резервная копия"),
+        (16, "Открыть порт VPN в ufw"),
     ],
 ]
 
@@ -616,18 +610,20 @@ def _ask_or_back(prompt: str, default=None, cast=None):
     return raw
 
 
-def _pick_client(cfg: dict, include_revoked: bool = False):
-    """Выбор клиента списком: можно ввести номер или имя, Enter — вернуться."""
+def _pick_client(cfg: dict, include_revoked: bool = False, prompt: str = "Номер или имя клиента",
+                 show_list: bool = True):
+    """Выбор клиента: можно ввести номер из списка или имя. Enter — вернуться."""
     rows = [r for r in clients.listing(cfg)
             if include_revoked or r["status"] != "отозван"]
     if not rows:
         info("Клиентов пока нет. Создайте первого пунктом 1.")
         return None
-    print(bold("Клиенты:"))
-    for index, row in enumerate(rows, 1):
-        print("  %2d) %-24s %-8s до %s" % (index, row["name"], row["status"], row["expires"]))
-    print()
-    raw = _ask_or_back("Номер или имя клиента")
+    if show_list:
+        print(bold("Клиенты:"))
+        for index, row in enumerate(rows, 1):
+            print("  %2d) %-24s %-8s до %s" % (index, row["name"], row["status"], row["expires"]))
+        print()
+    raw = _ask_or_back(prompt)
     if raw is None:
         return None
     if raw.isdigit() and 1 <= int(raw) <= len(rows):
@@ -642,12 +638,23 @@ def _menu_client_add(cfg: dict) -> None:
     name = _ask_or_back("Имя нового клиента")
     if name is None:
         return
-    days = _ask_or_back("Срок сертификата, дней", cfg["client_days"], int)
-    if days is None:
+    cmd_client_add(_Args(name=name, days=None, ip=None, print_profile=False))
+    if ask_yes_no("Вывести профиль на экран?", False):
+        print()
+        cmd_client_show(_Args(name=name, path=False))
+
+
+def _menu_client_list(cfg: dict) -> None:
+    """Список клиентов, а следом — возможность вывести чей-нибудь .ovpn."""
+    cmd_client_list(_Args(json=False))
+    if not clients.listing(cfg):
         return
-    ip = _ask_or_back("Закрепить адрес в VPN-подсети (Enter — не нужно)", "нет")
-    static_ip = None if ip in (None, "нет") else ip
-    cmd_client_add(_Args(name=name, days=days, ip=static_ip, print_profile=False))
+    print()
+    name = _pick_client(cfg, prompt="Вывести .ovpn клиента — номер или имя", show_list=False)
+    if name is None:
+        return
+    print()
+    cmd_client_show(_Args(name=name, path=False))
 
 
 def _menu_client_action(cfg: dict, action) -> None:
@@ -693,27 +700,23 @@ def _menu_ufw(cfg: dict) -> None:
 
 MENU_ACTIONS = {
     "1": _menu_client_add,
-    "2": lambda cfg: cmd_client_list(_Args(json=False)),
-    "3": lambda cfg: _menu_client_action(
-        cfg, lambda name: cmd_client_show(_Args(name=name, path=False))),
+    "2": _menu_client_list,
+    "3": lambda cfg: cmd_online(_Args(json=False)),
     "4": lambda cfg: _menu_client_action(
         cfg, lambda name: cmd_client_renew(_Args(name=name, days=None, new_key=False))),
     "5": lambda cfg: _menu_client_action(
-        cfg, lambda name: cmd_client_revoke(_Args(name=name, yes=False))),
-    "6": lambda cfg: _menu_client_action(
         cfg, lambda name: cmd_client_delete(_Args(name=name, yes=False))),
-    "7": _menu_client_ip,
-    "8": lambda cfg: cmd_status(_Args(json=False)),
-    "9": lambda cfg: cmd_online(_Args(json=False)),
-    "10": lambda cfg: cmd_server(_Args(action="restart", lines=50)),
-    "11": lambda cfg: cmd_server(_Args(action="logs", lines=50)),
-    "12": lambda cfg: cmd_server(_Args(action="rebuild", lines=50)),
-    "13": _menu_change_settings,
-    "14": lambda cfg: cmd_pki_check(_Args(json=False)),
-    "15": lambda cfg: cmd_pki_renew(_Args(force=False, quiet=False)),
-    "16": lambda cfg: cmd_doctor(_Args()),
-    "17": lambda cfg: cmd_backup(_Args(output=None)),
-    "18": _menu_ufw,
+    "6": _menu_client_ip,
+    "7": lambda cfg: cmd_status(_Args(json=False)),
+    "8": lambda cfg: cmd_server(_Args(action="restart", lines=50)),
+    "9": lambda cfg: cmd_server(_Args(action="logs", lines=50)),
+    "10": lambda cfg: cmd_server(_Args(action="rebuild", lines=50)),
+    "11": _menu_change_settings,
+    "12": lambda cfg: cmd_pki_check(_Args(json=False)),
+    "13": lambda cfg: cmd_pki_renew(_Args(force=False, quiet=False)),
+    "14": lambda cfg: cmd_doctor(_Args()),
+    "15": lambda cfg: cmd_backup(_Args(output=None)),
+    "16": _menu_ufw,
 }
 
 

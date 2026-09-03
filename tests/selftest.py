@@ -171,6 +171,16 @@ def main():
           pki.days_left(long_client["crt"]) <= pki.days_left(pki.CA_CRT),
           "(клиент %d, CA %d)" % (pki.days_left(long_client["crt"]), pki.days_left(pki.CA_CRT)))
 
+    print("\n== Определение чужих служб OpenVPN ==")
+    from ovpnctl.system import is_openvpn_server_unit
+    check("openvpn@server.service считается серверной", is_openvpn_server_unit("openvpn@server.service"))
+    check("openvpn.service считается серверной", is_openvpn_server_unit("openvpn.service"))
+    check("openvpn-server@vpn.service считается серверной",
+          is_openvpn_server_unit("openvpn-server@vpn.service"))
+    check("клиентская openvpn-client@work.service не трогается",
+          not is_openvpn_server_unit("openvpn-client@work.service"))
+    check("посторонний юнит не считается", not is_openvpn_server_unit("openvpn-monitor.timer"))
+
     print("\n== Разбор status-файла ==")
     os.makedirs(os.path.dirname(cfgmod.STATUS_FILE), exist_ok=True)
     with open(cfgmod.STATUS_FILE, "w") as fh:

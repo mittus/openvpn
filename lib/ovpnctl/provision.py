@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import os
 import shutil
+import sys
 
 from . import config as cfgmod
 from . import pki
@@ -11,6 +12,7 @@ from . import renew
 from . import server as srv
 from .system import (
     check_supported,
+    running_openvpn_units,
     daemon_reload,
     default_nic,
     is_private_ip,
@@ -24,6 +26,7 @@ from .system import (
 )
 from .util import (
     OvpnError,
+    ask,
     ask_yes_no,
     bold,
     ensure_dir,
@@ -119,6 +122,102 @@ def resolve_settings(cfg: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Установка
 # --------------------------------------------------------------------------- #
+def preexisting_openvpn() -> dict:
+    """Следы ранее установленного вручную OpenVPN на этом сервере."""
+    import glob
+
+    configs = sorted(
+        set(glob.glob("/etc/openvpn/*.conf"))
+        | (set(glob.glob(os.path.join(cfgmod.SERVER_DIR, "*.conf")))
+           - {cfgmod.server_conf_path()})
+    )
+    return {"configs": configs, "units": running_openvpn_units(exclude=cfgmod.SERVICE)}
+
+
+def backup_openvpn_dir() -> str:
+    """Архив /etc/openvpn целиком — на случай, если там была чужая конфигурация."""
+    import tempfile
+
+    ensure_dir(cfgmod.BACKUP_DIR, 0o700)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp = tempfile.mkdtemp(prefix="ovpnctl-preexisting-")
+    try:
+        built = shutil.make_archive(os.path.join(tmp, "openvpn-before-ovpnctl-%s" % stamp),
+                                    "gztar", root_dir="/etc/openvpn", base_dir=".", logger=None)
+        target = os.path.join(cfgmod.BACKUP_DIR, os.path.basename(built))
+        shutil.move(built, target)
+        os.chmod(target, 0o600)
+        return target
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def purge_previous_openvpn(found: dict) -> dict:
+    """Отключает прежний сервер: службы — disable --now, конфиги — в архив.
+
+    После этого порт и подсеть свободны, и установка идёт на стандартных параметрах.
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    moved_to = os.path.join(cfgmod.BACKUP_DIR, "previous-openvpn-%s" % stamp)
+    result = {"units": [], "configs": [], "dir": moved_to}
+
+    for unit in found["units"]:
+        systemctl("disable", "--now", unit, check=False)
+        result["units"].append(unit)
+    # старые юниты могли быть неактивны, но включены в автозапуск
+    for unit in ("openvpn.service", "openvpn@server.service"):
+        if unit != cfgmod.SERVICE:
+            systemctl("disable", "--now", unit, check=False)
+
+    if found["configs"]:
+        ensure_dir(moved_to, 0o700)
+        for path in found["configs"]:
+            if not os.path.exists(path):
+                continue
+            target = os.path.join(moved_to, path.lstrip("/").replace("/", "_"))
+            shutil.move(path, target)
+            result["configs"].append(path)
+    return result
+
+
+def handle_preexisting(cfg: dict) -> dict:
+    """Что делать с ранее установленным OpenVPN: спрашиваем пользователя."""
+    found = preexisting_openvpn()
+    if not (found["configs"] or found["units"]):
+        return cfg
+
+    warn("Обнаружена прежняя конфигурация OpenVPN на этом сервере:")
+    for path in found["configs"]:
+        warn("  конфиг: %s" % path)
+    for unit in found["units"]:
+        warn("  активная служба: %s" % unit)
+    archive = backup_openvpn_dir()
+    ok("Резервная копия /etc/openvpn: %s" % archive)
+
+    if not sys.stdin.isatty():
+        warn("Терминала нет — прежний сервер оставлен как есть. Если он занимает порт, "
+             "остановите его и выполните: ovpnctl set --port <порт>")
+        return cfg
+
+    if ask_yes_no("Удалить прежний сервер (службы отключить, конфиги убрать в архив)?", True):
+        purged = purge_previous_openvpn(found)
+        ok("Прежний сервер отключён%s. Установка пойдёт на стандартных параметрах."
+           % (", конфиги перенесены в %s" % purged["dir"] if purged["configs"] else ""))
+        return cfg
+
+    if found["units"] and ask_yes_no(
+            "Тогда остановить его сейчас, чтобы освободить порт (автозапуск останется)?", True):
+        for unit in found["units"]:
+            systemctl("stop", unit, check=False)
+        ok("Прежние службы остановлены: %s" % ", ".join(found["units"]))
+        return cfg
+
+    cfg["port"] = ask("Порт для нового сервера (прежний остаётся работать)", 1195,
+                      lambda v: int(v) if 1 <= int(v) <= 65535 else (_ for _ in ()).throw(
+                          ValueError("порт должен быть 1–65535")))
+    return cfg
+
+
 def setup(args) -> None:
     require_root()
     dist = check_supported()
@@ -134,7 +233,8 @@ def setup(args) -> None:
             % cfgmod.CONFIG_PATH)
 
     cfg = cfgmod.load(required=False)
-
+    cfgmod.init_dirs()
+    cfg = handle_preexisting(cfg)
     cfg = resolve_settings(cfg)
     cfg["installed_at"] = pki.now_iso()
 
