@@ -726,7 +726,7 @@ MENU_ACTIONS = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ovpnctl",
-        description="Установка и управление OpenVPN-сервером (Debian 11/12/13, Ubuntu 20.04+).",
+        description="Установка и управление OpenVPN-сервером (Debian 10/11/12/13, Ubuntu 20.04+).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Без аргументов открывается интерактивное меню.",
     )

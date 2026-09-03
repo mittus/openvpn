@@ -41,9 +41,14 @@ srv(){ docker exec ovpn-server bash -c "$1"; }
 cli(){ docker exec ovpn-client bash -c "$1"; }
 probe(){ cli 'ping -c2 -W3 10.88.0.12 >/dev/null 2>&1 && echo ХОДИТ || echo "НЕ ХОДИТ"'; }
 
+FIXREPO='apt-get update -qq >/dev/null 2>&1 || { sed -i -e "s|deb.debian.org|archive.debian.org|g" -e "s|security.debian.org|archive.debian.org|g" -e "/-updates/d" /etc/apt/sources.list; echo "Acquire::Check-Valid-Until \"false\";" > /etc/apt/apt.conf.d/99archive; apt-get update -qq >/dev/null 2>&1; }'
+srv "$FIXREPO"; cli "$FIXREPO"
+
 srv 'export DEBIAN_FRONTEND=noninteractive
 mkdir -p /run/systemd/system /run/openvpn-server
-printf "#!/bin/sh\nexit 0\n" >/usr/local/bin/systemctl; chmod +x /usr/local/bin/systemctl; hash -r
+for b in systemctl systemd-tmpfiles; do printf "#!/bin/sh\nexit 0\n" > /usr/sbin/$b; chmod +x /usr/sbin/$b; done
+printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d
+hash -r
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq --no-install-recommends iproute2 iputils-ping procps ufw >/dev/null 2>&1
 cd /src && bash install.sh >/var/log/i.log 2>&1 </dev/null

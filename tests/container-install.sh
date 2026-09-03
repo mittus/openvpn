@@ -11,10 +11,27 @@ chk(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 skip(){ echo "  [skip] $1"; }
 
 echo "=== система: $(. /etc/os-release; echo "$PRETTY_NAME") ==="
+# Заглушки systemd: в контейнере его нет, а postinst пакета openvpn его дёргает.
+# Кладём в /usr/sbin — dpkg-скрипты не видят /usr/local/bin.
 mkdir -p /run/systemd/system
-printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/systemctl; chmod +x /usr/local/bin/systemctl; hash -r
-apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq --no-install-recommends python3 tar iproute2 bsdextrautils util-linux >/dev/null 2>&1
+for b in systemctl systemd-tmpfiles; do
+    printf '#!/bin/sh\nexit 0\n' > "/usr/sbin/$b"; chmod +x "/usr/sbin/$b"
+done
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d
+hash -r
+# На снятых с поддержки выпусках (Debian 10) пакеты живут в archive.debian.org
+fix_eol_repos() {
+    apt-get update -qq >/dev/null 2>&1 && return 0
+    if [ -f /etc/apt/sources.list ] && grep -qE 'deb\.debian\.org|security\.debian\.org' /etc/apt/sources.list; then
+        sed -i -e 's|deb.debian.org|archive.debian.org|g' \
+               -e 's|security.debian.org|archive.debian.org|g' \
+               -e '/-updates/d' /etc/apt/sources.list
+        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+        apt-get update -qq >/dev/null 2>&1
+    fi
+}
+fix_eol_repos
+apt-get install -y -qq --no-install-recommends python3 tar iproute2 >/dev/null 2>&1
 
 # занимаем 10.8.0.0/24, чтобы проверить автоподбор свободной VPN-подсети
 ip link add dummy0 type dummy 2>/dev/null && ip addr add 10.8.0.1/24 dev dummy0 2>/dev/null \

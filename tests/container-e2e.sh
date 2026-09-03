@@ -10,22 +10,30 @@ skip(){ echo "  [skip] $1"; }
 chk(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
 echo "=== система: $(. /etc/os-release; echo "$PRETTY_NAME") ==="
+# Заглушки systemd: в контейнере его нет, а postinst пакета openvpn его дёргает.
+# Кладём в /usr/sbin — dpkg-скрипты не видят /usr/local/bin.
+mkdir -p /run/systemd/system
+for b in systemctl systemd-tmpfiles; do
+    printf '#!/bin/sh\nexit 0\n' > "/usr/sbin/$b"; chmod +x "/usr/sbin/$b"
+done
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d
+hash -r
 # вспомогательные утилиты для самого теста (не зависимости ovpnctl)
-apt-get update -qq >/dev/null 2>&1
+# На снятых с поддержки выпусках (Debian 10) пакеты живут в archive.debian.org
+fix_eol_repos() {
+    apt-get update -qq >/dev/null 2>&1 && return 0
+    if [ -f /etc/apt/sources.list ] && grep -qE 'deb\.debian\.org|security\.debian\.org' /etc/apt/sources.list; then
+        sed -i -e 's|deb.debian.org|archive.debian.org|g' \
+               -e 's|security.debian.org|archive.debian.org|g' \
+               -e '/-updates/d' /etc/apt/sources.list
+        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+        apt-get update -qq >/dev/null 2>&1
+    fi
+}
+fix_eol_repos
 apt-get install -y -qq --no-install-recommends iputils-ping procps iproute2 >/dev/null 2>&1
 
 # systemd в контейнере нет: подсовываем заглушку, службы поднимем вручную
-mkdir -p /run/systemd/system
-cat >/usr/local/bin/systemctl <<'STUB'
-#!/bin/sh
-echo "[systemctl] $*" >> /var/log/systemctl-stub.log
-case "$1" in
-  is-active|is-enabled) exit 0 ;;
-esac
-exit 0
-STUB
-chmod +x /usr/local/bin/systemctl
-hash -r
 
 echo; echo "=== 1. install.sh ==="
 cd /src || exit 1

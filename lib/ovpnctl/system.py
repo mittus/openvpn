@@ -10,7 +10,7 @@ import urllib.request
 from .util import OvpnError, info, run, run_ok, warn, which, write_file
 
 SUPPORTED = {
-    "debian": (11, 13),
+    "debian": (10, 13),
     "ubuntu": (20, 26),
 }
 
@@ -111,6 +111,13 @@ def verify_dependencies(install: bool = True) -> dict:
     ossl = openssl_version()
     if ossl < (1, 1):
         raise OvpnError("нужен OpenSSL 1.1+, найден %s." % ".".join(map(str, ossl)))
+
+    unit_paths = ["/lib/systemd/system/openvpn-server@.service",
+                  "/usr/lib/systemd/system/openvpn-server@.service"]
+    if not any(os.path.exists(path) for path in unit_paths):
+        raise OvpnError(
+            "в системе нет юнита openvpn-server@.service — пакет openvpn слишком старый "
+            "или собран иначе; обновите дистрибутив или пакет openvpn.")
 
     if not os.path.exists("/dev/net/tun"):
         run(["modprobe", "tun"], check=False)

@@ -3,7 +3,7 @@
 # ovpnctl bootstrap installer
 # ---------------------------
 # Разворачивает OpenVPN + собственный PKI + CLI-менеджер (ovpnctl) одной командой.
-# Поддержка: Debian 11/12/13, Ubuntu 20.04/22.04/24.04+ (amd64/arm64).
+# Поддержка: Debian 10/11/12/13, Ubuntu 20.04/22.04/24.04+ (amd64/arm64).
 #
 #   Установка одной командой:
 #       sudo bash <(wget -qO- https://raw.githubusercontent.com/mittus/openvpn/master/install.sh)
@@ -56,8 +56,12 @@ detect_os() {
     case "$OS_ID" in
         debian)
             MAJOR="${OS_VER%%.*}"
-            if [ "${MAJOR:-0}" -lt 11 ] 2>/dev/null; then
-                die "Debian $OS_VER не поддерживается (нужен 11+)."
+            if [ "${MAJOR:-0}" -lt 10 ] 2>/dev/null; then
+                die "Debian $OS_VER не поддерживается (нужен 10+)."
+            fi
+            if [ "${MAJOR:-0}" -eq 10 ] 2>/dev/null; then
+                warn "Debian 10 снят с поддержки: обновления безопасности не выходят,"
+                warn "а пакеты доступны только из archive.debian.org. Рекомендуется обновиться до 12."
             fi
             if [ "${MAJOR:-0}" -gt 13 ] 2>/dev/null; then
                 warn "Debian $OS_VER новее протестированных — продолжаю."
@@ -108,10 +112,50 @@ preflight() {
 # --------------------------------------------------------------------------- #
 # 2. Пакеты и зависимости (с перепроверкой)
 # --------------------------------------------------------------------------- #
+# На снятых с поддержки Debian (10 и старше) пакеты живут в archive.debian.org,
+# а обычные зеркала отдают 404 — предлагаем переключить источники.
+fix_archived_repos() {
+    local list=/etc/apt/sources.list
+    [ -f "$list" ] || return 1
+    grep -qE 'deb\.debian\.org|security\.debian\.org' "$list" || return 1
+
+    warn "Репозитории этого выпуска Debian переехали в archive.debian.org."
+    if [ -t 0 ]; then
+        printf '%s Переключить %s на archive.debian.org? [Y/n]: ' "$LOG_TAG" "$list" >&2
+        read -r answer </dev/tty || answer=""
+        case "${answer:-y}" in [Nn]*) return 1 ;; esac
+    else
+        # без терминала не трогаем системные источники — показываем готовую команду
+        warn "Нет терминала: источники не меняю. Выполните вручную и повторите установку:"
+        warn "  sed -i -e 's|deb.debian.org|archive.debian.org|g' \\"
+        warn "         -e 's|security.debian.org|archive.debian.org|g' \\"
+        warn "         -e '/-updates/d' $list && apt-get update"
+        return 1
+    fi
+
+    cp -a "$list" "$list.ovpnctl.bak"
+    sed -i -e 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|g' \
+           -e 's|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' \
+           -e 's|http://security.debian.org|http://archive.debian.org|g' \
+           -e 's|http://deb.debian.org|http://archive.debian.org|g' \
+           -e 's|https://deb.debian.org|http://archive.debian.org|g' \
+           -e '/-updates/d' "$list"
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99ovpnctl-archive
+    ok "Источники переключены на archive.debian.org (оригинал: $list.ovpnctl.bak)."
+    return 0
+}
+
 apt_update_once() {
     if [ -z "${_APT_UPDATED:-}" ]; then
         info "apt-get update…"
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq || warn "apt-get update завершился с ошибкой, продолжаю с текущими индексами."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null; then
+            if fix_archived_repos; then
+                DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+                    || warn "apt-get update снова с ошибкой, продолжаю с текущими индексами."
+            else
+                warn "apt-get update завершился с ошибкой, продолжаю с текущими индексами."
+            fi
+        fi
         _APT_UPDATED=1
     fi
 }
@@ -161,14 +205,16 @@ install_packages() {
     done
 
     # ПЕРЕПРОВЕРКА версий
-    OPENVPN_VER=$(openvpn --version 2>/dev/null | head -1 | awk '{print $2}')
-    OPENSSL_VER=$(openssl version 2>/dev/null | awk '{print $2}')
+    # openvpn --version в ветке 2.4 завершается с кодом 1 — под set -e/pipefail
+    # это уронило бы установщик, поэтому гасим код возврата явно
+    OPENVPN_VER=$( { openvpn --version 2>/dev/null || true; } | head -1 | awk '{print $2}')
+    OPENSSL_VER=$( { openssl version 2>/dev/null || true; } | awk '{print $2}')
     PY_VER=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')
 
     local py_major py_minor
     py_major=${PY_VER%%.*}; py_minor=${PY_VER##*.}
-    if [ "$py_major" -lt 3 ] || { [ "$py_major" -eq 3 ] && [ "$py_minor" -lt 8 ]; }; then
-        die "нужен Python 3.8+, найден $PY_VER."
+    if [ "$py_major" -lt 3 ] || { [ "$py_major" -eq 3 ] && [ "$py_minor" -lt 7 ]; }; then
+        die "нужен Python 3.7+, найден $PY_VER."
     fi
     case "$OPENVPN_VER" in
         2.[4-9]*|2.[1-9][0-9]*|[3-9].*) : ;;
